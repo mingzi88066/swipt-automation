@@ -29,16 +29,22 @@ const MENU_OPEN_MS = 800; // 点击「更多」后等菜单弹出
 const FIND_TIMEOUT_MS = 5000; // 找按钮的最长等待
 const ATTEMPT_COOLDOWN_MS = 8000; // 一次失败后的冷却
 const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
-const POLL_INTERVAL_MS = 1000; // 轮询间隔
-const LOG_MAX_CHARS = 96 * 1024; // 日志文件上限，超过则截断保留后半段
 
-// ===== 通话会话状态（两个监听器共享）=====
+// ===== 性能参数（1.0.1 重点：不再每秒抓全屏无障碍树）=====
+const IDLE_POLL_MS = 5000; // 空闲时轮询间隔（原 1000ms）
+const CALL_POLL_MS = 800; // 确认在通话中时的轮询间隔
+const WAKE_WINDOW_MS = 15000; // 收到电话相关事件后 15s 内保持快节奏
+const SNAPSHOT_CACHE_MS = 400; // 同一时刻的重复取树直接复用
+const LOG_MAX_CHARS = 32 * 1024; // 日志上限（原 96KB，读写开销太大）
+const LOG_FLUSH_MS = 2000; // 日志先攒内存，2s 或满 20 行再落盘
+
+// ===== 通话会话状态 =====
 interface CallSession {
-  inCall: boolean; // 当前是否处于通话界面
-  recording: boolean; // 本通电话是否已开启录音
-  attempts: number; // 本通电话已尝试次数
-  lastAttemptAt: number; // 上次尝试时间
-  busy: boolean; // recordCall 是否正在执行
+  inCall: boolean;
+  recording: boolean;
+  attempts: number;
+  lastAttemptAt: number;
+  busy: boolean;
 }
 const session: CallSession = {
   inCall: false,
@@ -52,30 +58,69 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ===== 日志：console（可用 swipt device logs 查看）+ 文件（串行写入，带截断）=====
-// 写文件是"读-改-写"，两个监听器并发调用会互相覆盖丢行，所以用队列串行化
-let logQueue: Promise<void> = Promise.resolve();
+// ===== 可被事件提前唤醒的等待 =====
+// 事件到来时不必等满 IDLE_POLL_MS，立刻开始下一轮检测
+let kick: (() => void) | null = null;
+
+function kickLoop() {
+  const fn = kick;
+  kick = null;
+  if (fn) fn();
+}
+
+function waitFor(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (kick === finish) kick = null;
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    kick = finish;
+  });
+}
+
+// ===== 日志：内存缓冲 + 定时落盘（避免每行都读改写整个文件）=====
+let logBuffer: string[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let flushing = false;
 
 function writeLog(text: string): Promise<void> {
   console.info(`[auto-call-recorder] ${text}`);
-  const entry = `[${new Date().toISOString()}] ${text}\n`;
-  logQueue = logQueue.then(() => appendLog(entry));
-  return logQueue;
+  logBuffer.push(`[${new Date().toISOString()}] ${text}`);
+  if (logBuffer.length >= 20) {
+    void flushLog();
+  } else if (flushTimer === null) {
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      void flushLog();
+    }, LOG_FLUSH_MS);
+  }
+  return Promise.resolve();
 }
 
-async function appendLog(entry: string) {
+async function flushLog(): Promise<void> {
+  if (flushing || logBuffer.length === 0) return;
+  flushing = true;
+  const chunk = `${logBuffer.join("\n")}\n`;
+  logBuffer = [];
   try {
     const file = fs.dataDirectory.file("debug.log");
     let existing = "";
     try {
       existing = await file.text();
     } catch {}
-    if (existing.length > LOG_MAX_CHARS) {
-      existing = existing.slice(Math.floor(LOG_MAX_CHARS / 2));
-    }
-    await file.write(existing + entry);
+    const merged = existing + chunk;
+    await file.write(
+      merged.length > LOG_MAX_CHARS ? merged.slice(-LOG_MAX_CHARS) : merged,
+    );
   } catch (e) {
     console.error("[auto-call-recorder] 写日志失败:", e);
+  } finally {
+    flushing = false;
   }
 }
 
@@ -99,7 +144,6 @@ function collectElements(
 
 async function dumpScreenToLog(prefix: string) {
   try {
-    // 通话界面挂在 SpringBoard 覆盖层上，必须用 fullScreen 才能读到
     const snapshot = await accessibility.snapshot({
       scope: "fullScreen",
       full: true,
@@ -117,16 +161,61 @@ async function dumpScreenToLog(prefix: string) {
   }
 }
 
-// ===== 通话界面检测 =====
-async function getCallRoot(): Promise<AccessibilityElement | null> {
+// ===== 前台应用：便宜的先探针，避免每次都抓整棵树 =====
+function foregroundBundle(fg: unknown): string | null {
+  if (typeof fg === "string") return fg;
+  if (fg !== null && typeof fg === "object") {
+    const obj = fg as Record<string, unknown>;
+    for (const key of ["bundleId", "bundleIdentifier", "identifier", "id"]) {
+      const value = obj[key];
+      if (typeof value === "string") return value;
+    }
+  }
+  return null;
+}
+
+async function isPhoneLikelyForeground(): Promise<boolean> {
+  // 已在通话中就不再拦截，保证检测连续性
+  if (session.inCall) return true;
+  let bundle: string | null = null;
   try {
-    const snapshot = await accessibility.snapshot({
-      scope: "fullScreen",
-      full: true,
-    });
-    return snapshot.root;
+    bundle = foregroundBundle(await device.foregroundApplication.get());
   } catch {
-    return null;
+    return true; // 读不到就保守处理，宁可多抓一次也不漏接电话
+  }
+  if (bundle === null) return true;
+  return phoneBundleIds.has(bundle);
+}
+
+// ===== 快照：短期缓存 + 并发去重 =====
+let snapshotCache: { at: number; root: AccessibilityElement | null } | null =
+  null;
+let inflightSnapshot: Promise<AccessibilityElement | null> | null = null;
+
+async function getCallRoot(): Promise<AccessibilityElement | null> {
+  const now = Date.now();
+  if (snapshotCache !== null && now - snapshotCache.at < SNAPSHOT_CACHE_MS) {
+    return snapshotCache.root;
+  }
+  if (inflightSnapshot !== null) return inflightSnapshot;
+
+  inflightSnapshot = (async () => {
+    try {
+      const snapshot = await accessibility.snapshot({
+        scope: "fullScreen",
+        full: true,
+      });
+      snapshotCache = { at: Date.now(), root: snapshot.root };
+      return snapshot.root;
+    } catch {
+      return null;
+    }
+  })();
+
+  try {
+    return await inflightSnapshot;
+  } finally {
+    inflightSnapshot = null;
   }
 }
 
@@ -136,6 +225,9 @@ function hasAnyLabel(el: AccessibilityElement, labels: string[]): boolean {
 }
 
 async function isCallActive(): Promise<boolean> {
+  // 先看前台应用（便宜），不是电话/SpringBoard 就不抓树
+  if (!(await isPhoneLikelyForeground())) return false;
+
   const root = await getCallRoot();
   if (root === null) return false;
   if (root.label !== undefined && CALL_APP_LABELS.includes(root.label)) {
@@ -232,7 +324,7 @@ async function recordCall(signal: AbortSignal): Promise<boolean> {
   return false;
 }
 
-// ===== 状态机：检测 + 触发（幂等，可被事件/轮询同时调用）=====
+// ===== 状态机：检测 + 触发（幂等）=====
 async function maybeHandle(signal: AbortSignal) {
   let active: boolean;
   try {
@@ -275,18 +367,20 @@ async function maybeHandle(signal: AbortSignal) {
   }
 }
 
-// ===== 监听器一：应用前后台事件（快速唤醒）=====
+// ===== 监听器一：应用前后台事件（只作为唤醒信号）=====
+let lastWakeAt = 0;
+
 async function watchByApplicationEvents(signal: AbortSignal) {
   await writeLog("应用事件监听已启动");
   for await (const event of device.applicationEvents({ signal })) {
     if (signal.aborted) return;
     if (!phoneBundleIds.has(event.bundleId)) continue;
-    // 事件只做唤醒，是否真的是通话界面由 maybeHandle 内部验证
-    await maybeHandle(signal);
+    lastWakeAt = Date.now();
+    kickLoop(); // 立即触发下一轮检测，而不是自己再抓一次树
   }
 }
 
-// ===== 监听器二：轮询兜底（事件丢失/不支持时也能工作）=====
+// ===== 监听器二：自适应轮询（唯一执行检测的通道）=====
 async function watchByPolling(signal: AbortSignal) {
   await writeLog("轮询检测已启动");
   while (!signal.aborted) {
@@ -295,7 +389,8 @@ async function watchByPolling(signal: AbortSignal) {
     } catch (error) {
       await writeLog(`轮询出错: ${error}`);
     }
-    await sleep(POLL_INTERVAL_MS);
+    const fast = session.inCall || Date.now() - lastWakeAt < WAKE_WINDOW_MS;
+    await waitFor(fast ? CALL_POLL_MS : IDLE_POLL_MS);
   }
 }
 
@@ -341,6 +436,8 @@ export default defineExtension({
       supervise("事件监听", () => watchByApplicationEvents(signal)),
       supervise("轮询检测", () => watchByPolling(signal)),
     ]);
+
+    await flushLog();
   },
 
   actions: {
@@ -381,6 +478,7 @@ export default defineExtension({
       description: "读取自动记录的调试日志",
       run: async () => {
         try {
+          await flushLog();
           const file = fs.dataDirectory.file("debug.log");
           return { log: await file.text() };
         } catch {
@@ -394,6 +492,7 @@ export default defineExtension({
       description: "清空调试日志文件",
       run: async () => {
         try {
+          logBuffer = [];
           await fs.dataDirectory.file("debug.log").write("");
           return { cleared: true };
         } catch {
