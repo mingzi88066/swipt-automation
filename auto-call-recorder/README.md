@@ -30,7 +30,28 @@ auto-call-recorder/
 
 ## 安装步骤
 
-### 方式 A：在手机 Linux 虚拟机里一键安装（无需电脑）
+### 方式 A：在 Swipt App 里添加仓库源（最简单，推荐）
+
+Swipt App → Swiplets（Swiplet 页）→ 添加 → 输入仓库 URL：
+
+```
+https://mingzi88066.github.io/swiplets/swiplets.json
+```
+
+然后在列表里点「自动通话录音」安装，装完在界面里打开服务开关即可。以后有新版本，App 会自动提示更新（更新由 mingzi88066.github.io 仓库的 `swiplets/` 目录提供，更新方法见下）。
+
+#### 如何发布新版本
+
+```bash
+cd auto-call-recorder
+# 改 package.json 里的 version（如 1.0.1）
+npm install && npx swipt project build
+npx swipt project source dist/auto-call-recorder.swiplet
+# 把 dist/swiplets.json 和 dist/auto-call-recorder.swiplet 复制到
+# mingzi88066.github.io 仓库的 swiplets/ 目录并 push
+```
+
+### 方式 B：在手机 Linux 虚拟机里一键安装（无需电脑）
 
 适用于 iPhone 上运行 LinuxRunner / Debian 虚拟机的情况。在虚拟机终端里执行：
 
