@@ -1,0 +1,28 @@
+{
+  "id": "auto-call-recorder",
+  "name": "Auto Call Recorder",
+  "localizedNames": {
+    "zh-Hans": "自动通话录音"
+  },
+  "version": "1.0.0",
+  "icon": {
+    "color": "#1C1C1E",
+    "symbol": "mic.circle.fill",
+    "symbolColor": "#FF3B30"
+  },
+  "minimumAPILevel": 3,
+  "minimumIOSVersion": 17.4,
+  "service": true,
+  "actions": [
+    {
+      "name": "inspect",
+      "title": "Inspect Current Screen",
+      "description": "打印当前无障碍树，用于调试"
+    },
+    {
+      "name": "triggerOnce",
+      "title": "Trigger Once",
+      "description": "立即尝试点击当前通话界面的录音按钮"
+    }
+  ]
+}

@@ -6,7 +6,7 @@
   "swiplet": {
     "id": "auto-call-recorder",
     "name": "Auto Call Recorder",
-    "minimumAPILevel": 2,
+    "minimumAPILevel": 3,
     "localizedNames": {
       "zh-Hans": "自动通话录音"
     },
