@@ -52,9 +52,18 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ===== 日志：console（可用 swipt device logs 查看）+ 文件（带截断）=====
-async function writeLog(text: string) {
+// ===== 日志：console（可用 swipt device logs 查看）+ 文件（串行写入，带截断）=====
+// 写文件是"读-改-写"，两个监听器并发调用会互相覆盖丢行，所以用队列串行化
+let logQueue: Promise<void> = Promise.resolve();
+
+function writeLog(text: string): Promise<void> {
   console.info(`[auto-call-recorder] ${text}`);
+  const entry = `[${new Date().toISOString()}] ${text}\n`;
+  logQueue = logQueue.then(() => appendLog(entry));
+  return logQueue;
+}
+
+async function appendLog(entry: string) {
   try {
     const file = fs.dataDirectory.file("debug.log");
     let existing = "";
@@ -64,7 +73,6 @@ async function writeLog(text: string) {
     if (existing.length > LOG_MAX_CHARS) {
       existing = existing.slice(Math.floor(LOG_MAX_CHARS / 2));
     }
-    const entry = `[${new Date().toISOString()}] ${text}\n`;
     await file.write(existing + entry);
   } catch (e) {
     console.error("[auto-call-recorder] 写日志失败:", e);
@@ -181,38 +189,47 @@ async function recordCall(signal: AbortSignal): Promise<boolean> {
   await sleep(STABILIZE_MS);
   if (signal.aborted) return false;
 
-  // 第一步：点击「更多」
-  if (!(await findAndTap(MORE_LABEL, signal))) {
-    await dumpScreenToLog("未找到更多按钮时的界面");
-    return false;
-  }
+  // 「更多」→「通话录音」，菜单没弹出时重试一次
+  for (let round = 0; round < 2; round++) {
+    // 第一步：点击「更多」
+    if (!(await findAndTap(MORE_LABEL, signal))) {
+      await dumpScreenToLog("未找到更多按钮时的界面");
+      return false;
+    }
 
-  // 等待菜单弹出
-  await sleep(MENU_OPEN_MS);
-  if (signal.aborted) return false;
+    // 等待菜单弹出
+    await sleep(MENU_OPEN_MS);
+    if (signal.aborted) return false;
 
-  // 第二步：点击「通话录音」
-  if (!(await findAndTap(RECORD_LABEL, signal))) {
-    await dumpScreenToLog("未找到通话录音按钮时的界面");
-    return false;
-  }
-
-  // 第三步：确认出现「停止通话录音」
-  try {
-    const confirmed = await accessibility.find(
-      { label: STOP_RECORD_LABEL },
-      { timeoutMs: 3000, poll: true, signal },
-    );
-    if (confirmed !== null) {
-      await writeLog("录音已开启 ✅");
+    // 第二步：点击「通话录音」
+    if (await findAndTap(RECORD_LABEL, signal, 4000)) {
+      // 第三步：确认出现「停止通话录音」
+      try {
+        const confirmed = await accessibility.find(
+          { label: STOP_RECORD_LABEL },
+          { timeoutMs: 3000, poll: true, signal },
+        );
+        if (confirmed !== null) {
+          await writeLog("录音已开启 ✅");
+          return true;
+        }
+      } catch (error) {
+        if (signal.aborted || (error as Error).name === "AbortError") {
+          throw error;
+        }
+      }
+      // 菜单可能已收起导致确认按钮读不到，视为已点击
+      await writeLog("已点击「通话录音」（未读到确认按钮，请留意设备）");
       return true;
     }
-  } catch (error) {
-    if (signal.aborted || (error as Error).name === "AbortError") throw error;
+
+    if (round === 0) {
+      await writeLog("菜单未出现，重试点击「更多」");
+    }
   }
-  // 菜单可能已收起导致确认按钮读不到，视为已点击
-  await writeLog("已点击「通话录音」（未读到确认按钮，请留意设备）");
-  return true;
+
+  await dumpScreenToLog("未找到通话录音按钮时的界面");
+  return false;
 }
 
 // ===== 状态机：检测 + 触发（幂等，可被事件/轮询同时调用）=====
