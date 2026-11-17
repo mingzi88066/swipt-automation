@@ -71,24 +71,29 @@ if ! curl -sS -m 5 "$DEVICE_URL" >/dev/null 2>&1; then
   echo "     DEVICE_URL=http://<手机IP>:29937 sh $0"
   exit 1
 fi
-swipt device add "$DEVICE_URL" 2>/dev/null || echo "(设备可能已添加过，继续)"
-swipt device list
+
+# 直接写入 CLI 的设备记录文件（绕过 device add / device list：
+# 这两条命令会强制 mDNS 局域网扫描，虚拟机的网络栈不支持 multicast 会崩溃
+# —— setMulticastTTL ENOPROTOOPT）
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/swipt"
+mkdir -p "$CONF_DIR"
+printf '{"iPhone": "%s"}\n' "$DEVICE_URL" > "$CONF_DIR/devices.json"
+echo "设备已记录: $DEVICE_URL"
+echo "（注意: 在虚拟机里不要运行 swipt device list / device add，会触发 mDNS 崩溃；其余命令正常）"
 
 # ---------- 4. 下载并安装 Swiplet ----------
 step "下载 auto-call-recorder 安装包"
 curl -fsSL -m 120 -o /tmp/auto-call-recorder.swiplet "$PKG_URL"
 
 step "安装到设备（会替换旧版本）"
-swipt swiplet install /tmp/auto-call-recorder.swiplet -d "$DEVICE_URL" ||
-  swipt swiplet install /tmp/auto-call-recorder.swiplet
+swipt swiplet install /tmp/auto-call-recorder.swiplet -d "$DEVICE_URL"
 
 # ---------- 5. 启用服务 ----------
 step "启用自动录音服务"
-swipt swiplet service enable auto-call-recorder -d "$DEVICE_URL" ||
-  swipt swiplet service enable auto-call-recorder
+swipt swiplet service enable auto-call-recorder -d "$DEVICE_URL"
 
 step "完成 ✅ 当前 Swiplet 列表:"
-swipt swiplet list -d "$DEVICE_URL" 2>/dev/null || swipt swiplet list
+swipt swiplet list -d "$DEVICE_URL"
 
 echo
 echo "下一步: 打开手机上的 Swipt App → 自动通话录音，界面里也有开关和状态。"
