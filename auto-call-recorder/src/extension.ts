@@ -1,10 +1,10 @@
 import * as accessibility from "@swipt/api/accessibility";
 import type { AccessibilityElement } from "@swipt/api/accessibility";
 import * as device from "@swipt/api/device";
+import * as fs from "@swipt/api/file-system";
 import { defineAction, defineExtension } from "@swipt/api/swiplet";
 
 // 可能的电话相关 bundleId。
-// 注意：实际 bundleId 因 iOS 版本和通话场景而异，建议先用调试动作确认。
 const phoneBundleIds = new Set([
   "com.apple.mobilephone",
   "com.apple.InCallService",
@@ -25,17 +25,69 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// 把调试日志写入 Swiplet 数据目录的文件
+async function writeLog(text: string) {
+  try {
+    const dir = fs.dataDirectory;
+    const file = dir.file("debug.log");
+    // 读取已有内容，追加新内容
+    let existing = "";
+    try {
+      existing = await file.text();
+    } catch {
+      // 文件不存在
+    }
+    const timestamp = new Date().toISOString();
+    const entry = `[${timestamp}] ${text}\n`;
+    await file.write(existing + entry);
+  } catch (e) {
+    console.error("[auto-call-recorder] 写日志失败:", e);
+  }
+}
+
+// 把无障碍树转成可读文本并写入日志
+async function dumpScreenToLog(prefix: string) {
+  try {
+    const foreground = await device.foregroundApplication.get();
+    const snapshot = await accessibility.snapshot({ full: true });
+    const lines: string[] = [];
+    lines.push(`--- ${prefix} ---`);
+    lines.push(`前台应用: ${JSON.stringify(foreground)}`);
+    lines.push(`无障碍树:`);
+    collectElements(snapshot.root, 0, lines);
+    await writeLog(lines.join("\n"));
+  } catch (e) {
+    await writeLog(`${prefix} 截取无障碍树失败: ${e}`);
+  }
+}
+
+function collectElements(el: AccessibilityElement, depth: number, out: string[]) {
+  const indent = "  ".repeat(depth);
+  const parts: string[] = [];
+  if (el.role) parts.push(`role=${el.role}`);
+  if (el.label) parts.push(`label="${el.label}"`);
+  if (el.value) parts.push(`value="${el.value}"`);
+  if (el.frame) parts.push(`frame=[${el.frame.join(",")}]`);
+  if (el.traits?.length) parts.push(`traits=[${el.traits.join(",")}]`);
+  if (parts.length) {
+    out.push(`${indent}${parts.join(" ")}`);
+  }
+  for (const child of el.children) {
+    collectElements(child, depth + 1, out);
+  }
+}
+
 async function tapElement(
   element: AccessibilityElement,
   label: string,
   signal: AbortSignal,
 ) {
   if (!element.frame) {
-    console.warn(`[auto-call-recorder] ${label} 没有位置信息`);
+    await writeLog(`${label} 没有位置信息`);
     return false;
   }
   await accessibility.tap(element, { signal });
-  console.log(`[auto-call-recorder] 已点击 ${label}`);
+  await writeLog(`已点击 ${label}`);
   return true;
 }
 
@@ -44,21 +96,24 @@ async function findAndTap(
   label: string,
   options: { timeoutMs: number; signal: AbortSignal },
 ) {
-  console.log(`[auto-call-recorder] 查找 ${label}...`);
+  await writeLog(`查找 ${label}...`);
   const element = await accessibility.find(selector, {
     timeoutMs: options.timeoutMs,
     poll: true,
     signal: options.signal,
   });
   if (!element) {
-    console.warn(`[auto-call-recorder] 未找到 ${label}`);
+    await writeLog(`未找到 ${label}`);
     return false;
   }
   return tapElement(element, label, options.signal);
 }
 
 async function recordCall(bundleId: string, pid: number, signal: AbortSignal) {
-  console.log(`[auto-call-recorder] 检测到通话界面: ${bundleId} pid ${pid}`);
+  await writeLog(`检测到通话界面: ${bundleId} pid ${pid}`);
+
+  // 先把当前界面元素写入日志（用于调试）
+  await dumpScreenToLog(`通话开始 ${bundleId}`);
 
   // 等待通话界面稳定
   await sleep(1200);
@@ -70,11 +125,17 @@ async function recordCall(bundleId: string, pid: number, signal: AbortSignal) {
     MORE_LABEL,
     { timeoutMs: 4000, signal },
   );
-  if (!moreTapped) return;
+  if (!moreTapped) {
+    await writeLog("「更多」按钮未找到，停止");
+    return;
+  }
 
   // 等待菜单弹出
   await sleep(800);
   if (signal.aborted) return;
+
+  // 点击「更多」后再次截图
+  await dumpScreenToLog(`点击更多后`);
 
   // 第二步：点击「通话录音」
   const recordTapped = await findAndTap(
@@ -84,12 +145,14 @@ async function recordCall(bundleId: string, pid: number, signal: AbortSignal) {
   );
 
   if (recordTapped) {
-    console.log(`[auto-call-recorder] 自动录音已触发`);
+    await writeLog(`自动录音已触发`);
+  } else {
+    await writeLog(`「通话录音」按钮未找到`);
   }
 }
 
 async function watchByApplicationEvents(signal: AbortSignal) {
-  console.log("[auto-call-recorder] 监听应用前台事件");
+  await writeLog("监听应用前台事件已启动");
   try {
     for await (const event of device.applicationEvents({ signal })) {
       if (!phoneBundleIds.has(event.bundleId)) {
@@ -102,12 +165,11 @@ async function watchByApplicationEvents(signal: AbortSignal) {
         if (running) {
           running.abort();
           activeCalls.delete(event.pid);
-          console.log(`[auto-call-recorder] 通话结束: ${event.bundleId}`);
+          await writeLog(`通话结束: ${event.bundleId}`);
         }
         continue;
       }
 
-      // 避免同一个通话重复触发
       if (running) {
         continue;
       }
@@ -117,21 +179,21 @@ async function watchByApplicationEvents(signal: AbortSignal) {
         activeCalls.set(event.pid, controller);
 
         recordCall(event.bundleId, event.pid, controller.signal).catch(
-          (error: Error) => {
+          async (error: Error) => {
             if (error.name !== "AbortError") {
-              console.error("[auto-call-recorder] 录音失败:", error);
+              await writeLog(`录音失败: ${error}`);
             }
           },
         );
       }
     }
   } catch (error) {
-    console.error("[auto-call-recorder] applicationEvents 出错:", error);
+    await writeLog(`applicationEvents 出错: ${error}`);
   }
 }
 
 async function watchByPolling(signal: AbortSignal) {
-  console.log("[auto-call-recorder] 启动轮询检测（备用）");
+  await writeLog("轮询检测已启动（备用）");
   while (!signal.aborted) {
     try {
       const foreground = await device.foregroundApplication.get();
@@ -143,24 +205,24 @@ async function watchByPolling(signal: AbortSignal) {
         if (!activeCalls.has(key)) {
           const controller = new AbortController();
           activeCalls.set(key, controller);
-          recordCall(bundleId, pid, controller.signal).catch((error: Error) => {
-            if (error.name !== "AbortError") {
-              console.error("[auto-call-recorder] 录音失败:", error);
-            }
-          });
+          recordCall(bundleId, pid, controller.signal).catch(
+            async (error: Error) => {
+              if (error.name !== "AbortError") {
+                await writeLog(`录音失败: ${error}`);
+              }
+            },
+          );
         }
       } else {
         // 清理已结束通话
         for (const [key, controller] of activeCalls) {
-          if (typeof key === "string" || key === pid) {
-            controller.abort();
-            activeCalls.delete(key);
-            console.log(`[auto-call-recorder] 通话结束: ${bundleId}`);
-          }
+          controller.abort();
+          activeCalls.delete(key);
+          await writeLog(`通话结束（轮询检测）: ${bundleId}`);
         }
       }
     } catch (error) {
-      console.error("[auto-call-recorder] 轮询出错:", error);
+      await writeLog(`轮询出错: ${error}`);
     }
     await sleep(1000);
   }
@@ -168,7 +230,7 @@ async function watchByPolling(signal: AbortSignal) {
 
 export default defineExtension({
   async run({ signal }) {
-    console.log("[auto-call-recorder] 服务已启动");
+    await writeLog("========== 服务已启动 ==========");
 
     // 同时监听应用事件和轮询前台应用，提高可靠性
     await Promise.race([
@@ -178,17 +240,20 @@ export default defineExtension({
   },
 
   actions: {
-    // 调试用：列出当前界面元素，帮助确认按钮文本和 bundleId
+    // 调试用：列出当前界面元素
     inspect: defineAction({
       title: "Inspect Current Screen",
       description: "打印当前无障碍树，用于调试",
       run: async () => {
         const snapshot = await accessibility.snapshot({ full: true });
         const foreground = await device.foregroundApplication.get();
-        return {
+        const result = {
           app: foreground,
           tree: simplifyTree(snapshot.root),
         };
+        // 同时写入日志文件
+        await dumpScreenToLog("inspect 动作");
+        return result;
       },
     }),
 
@@ -204,6 +269,36 @@ export default defineExtension({
           return { ok: true };
         } finally {
           clearTimeout(timeout);
+        }
+      },
+    }),
+
+    // 读取调试日志
+    readLog: defineAction({
+      title: "Read Debug Log",
+      description: "读取自动记录的调试日志",
+      run: async () => {
+        try {
+          const file = fs.dataDirectory.file("debug.log");
+          const text = await file.text();
+          return { log: text };
+        } catch {
+          return { log: "(日志文件不存在)" };
+        }
+      },
+    }),
+
+    // 清空调试日志
+    clearLog: defineAction({
+      title: "Clear Debug Log",
+      description: "清空调试日志文件",
+      run: async () => {
+        try {
+          const file = fs.dataDirectory.file("debug.log");
+          await file.write("");
+          return { cleared: true };
+        } catch {
+          return { cleared: false };
         }
       },
     }),
