@@ -4,8 +4,10 @@ import * as device from "@swipt/api/device";
 import * as fs from "@swipt/api/file-system";
 import { defineAction, defineExtension } from "@swipt/api/swiplet";
 
-// 可能的电话相关 bundleId。
+// 电话相关 bundleId
+// 注意：iOS 通话界面归属在 com.apple.springboard 下
 const phoneBundleIds = new Set([
+  "com.apple.springboard",
   "com.apple.mobilephone",
   "com.apple.InCallService",
   "com.apple.CoreTelephony",
@@ -14,9 +16,11 @@ const phoneBundleIds = new Set([
   "com.apple.TelephonyUtilities",
 ]);
 
-// 按钮文本（根据你的系统语言调整）
+// 按钮文本
 const MORE_LABEL = "更多";
 const RECORD_LABEL = "通话录音";
+const STOP_RECORD_LABEL = "停止通话录音";
+const CALL_APP_LABEL = "电话";
 
 // 每次通话只触发一次录音
 const activeCalls = new Map<number | string, AbortController>();
@@ -25,18 +29,14 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// 把调试日志写入 Swiplet 数据目录的文件
 async function writeLog(text: string) {
   try {
     const dir = fs.dataDirectory;
     const file = dir.file("debug.log");
-    // 读取已有内容，追加新内容
     let existing = "";
     try {
       existing = await file.text();
-    } catch {
-      // 文件不存在
-    }
+    } catch {}
     const timestamp = new Date().toISOString();
     const entry = `[${timestamp}] ${text}\n`;
     await file.write(existing + entry);
@@ -45,7 +45,6 @@ async function writeLog(text: string) {
   }
 }
 
-// 把无障碍树转成可读文本并写入日志
 async function dumpScreenToLog(prefix: string) {
   try {
     const foreground = await device.foregroundApplication.get();
@@ -75,6 +74,49 @@ function collectElements(el: AccessibilityElement, depth: number, out: string[])
   for (const child of el.children) {
     collectElements(child, depth + 1, out);
   }
+}
+
+// 检查当前界面是否为通话界面
+async function isCallActive(): Promise<boolean> {
+  try {
+    const snapshot = await accessibility.snapshot({ full: true });
+    const root = snapshot.root;
+
+    // 检查 application label 是否为「电话」
+    if (root.label === CALL_APP_LABEL) {
+      return true;
+    }
+
+    // 检查是否有通话相关按钮
+    const hasCallButtons = hasElement(root, "结束") || hasElement(root, "静音");
+    const hasMoreButton = hasElement(root, MORE_LABEL);
+    if (hasCallButtons && hasMoreButton) {
+      return true;
+    }
+
+    // 检查是否已经在录音（有「停止通话录音」按钮）
+    if (hasElement(root, STOP_RECORD_LABEL)) {
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function hasElement(el: AccessibilityElement, label: string): boolean {
+  if (el.label === label) return true;
+  for (const child of el.children) {
+    if (hasElement(child, label)) return true;
+  }
+  return false;
+}
+
+// 检查是否已经在录音
+async function isAlreadyRecording(): Promise<boolean> {
+  try {
+    const snapshot = await accessibility.snapshot({ full: true });
+    return hasElement(snapshot.root, STOP_RECORD_LABEL);
+  } catch {}
+  return false;
 }
 
 async function tapElement(
@@ -112,12 +154,18 @@ async function findAndTap(
 async function recordCall(bundleId: string, pid: number, signal: AbortSignal) {
   await writeLog(`检测到通话界面: ${bundleId} pid ${pid}`);
 
-  // 先把当前界面元素写入日志（用于调试）
+  // 先把当前界面元素写入日志
   await dumpScreenToLog(`通话开始 ${bundleId}`);
 
   // 等待通话界面稳定
-  await sleep(1200);
+  await sleep(1500);
   if (signal.aborted) return;
+
+  // 检查是否已经在录音了
+  if (await isAlreadyRecording()) {
+    await writeLog("已经在录音中，无需重复点击");
+    return;
+  }
 
   // 第一步：点击「更多」
   const moreTapped = await findAndTap(
@@ -194,17 +242,24 @@ async function watchByApplicationEvents(signal: AbortSignal) {
 
 async function watchByPolling(signal: AbortSignal) {
   await writeLog("轮询检测已启动（备用）");
+  let wasCallActive = false;
+
   while (!signal.aborted) {
     try {
-      const foreground = await device.foregroundApplication.get();
-      const bundleId = foreground?.bundleId ?? "";
-      const pid = foreground?.pid ?? 0;
+      const callActive = await isCallActive();
 
-      if (phoneBundleIds.has(bundleId)) {
+      if (callActive && !wasCallActive) {
+        // 通话刚开始
+        const foreground = await device.foregroundApplication.get();
+        const bundleId = foreground?.bundleId ?? "unknown";
+        const pid = foreground?.pid ?? 0;
         const key = pid || bundleId;
+
         if (!activeCalls.has(key)) {
           const controller = new AbortController();
           activeCalls.set(key, controller);
+          wasCallActive = true;
+
           recordCall(bundleId, pid, controller.signal).catch(
             async (error: Error) => {
               if (error.name !== "AbortError") {
@@ -213,12 +268,13 @@ async function watchByPolling(signal: AbortSignal) {
             },
           );
         }
-      } else {
-        // 清理已结束通话
+      } else if (!callActive && wasCallActive) {
+        // 通话结束
+        wasCallActive = false;
         for (const [key, controller] of activeCalls) {
           controller.abort();
           activeCalls.delete(key);
-          await writeLog(`通话结束（轮询检测）: ${bundleId}`);
+          await writeLog(`通话结束（轮询检测）`);
         }
       }
     } catch (error) {
@@ -232,7 +288,7 @@ export default defineExtension({
   async run({ signal }) {
     await writeLog("========== 服务已启动 ==========");
 
-    // 同时监听应用事件和轮询前台应用，提高可靠性
+    // 同时监听应用事件和轮询前台应用
     await Promise.race([
       watchByApplicationEvents(signal),
       watchByPolling(signal),
@@ -240,24 +296,20 @@ export default defineExtension({
   },
 
   actions: {
-    // 调试用：列出当前界面元素
     inspect: defineAction({
       title: "Inspect Current Screen",
       description: "打印当前无障碍树，用于调试",
       run: async () => {
         const snapshot = await accessibility.snapshot({ full: true });
         const foreground = await device.foregroundApplication.get();
-        const result = {
+        await dumpScreenToLog("inspect 动作");
+        return {
           app: foreground,
           tree: simplifyTree(snapshot.root),
         };
-        // 同时写入日志文件
-        await dumpScreenToLog("inspect 动作");
-        return result;
       },
     }),
 
-    // 调试用：直接尝试点击一次「更多」→「通话录音」
     triggerOnce: defineAction({
       title: "Trigger Once",
       description: "立即尝试点击当前通话界面的录音按钮",
@@ -273,7 +325,6 @@ export default defineExtension({
       },
     }),
 
-    // 读取调试日志
     readLog: defineAction({
       title: "Read Debug Log",
       description: "读取自动记录的调试日志",
@@ -288,7 +339,6 @@ export default defineExtension({
       },
     }),
 
-    // 清空调试日志
     clearLog: defineAction({
       title: "Clear Debug Log",
       description: "清空调试日志文件",
@@ -305,7 +355,6 @@ export default defineExtension({
   },
 });
 
-// 简化无障碍树用于调试输出
 function simplifyTree(element: AccessibilityElement, depth = 0): unknown {
   const result: Record<string, unknown> = {};
   if (element.role) result.role = element.role;
