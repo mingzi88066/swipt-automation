@@ -10,6 +10,8 @@ const phoneBundleIds = new Set([
   "com.apple.InCallService",
   "com.apple.CoreTelephony",
   "com.apple.CallKitService",
+  "com.apple.Phone",
+  "com.apple.TelephonyUtilities",
 ]);
 
 // 按钮文本（根据你的系统语言调整）
@@ -17,11 +19,10 @@ const MORE_LABEL = "更多";
 const RECORD_LABEL = "通话录音";
 
 // 每次通话只触发一次录音
-const activeCalls = new Map<number, AbortController>();
+const activeCalls = new Map<number | string, AbortController>();
 
-function centerOf(frame: NonNullable<AccessibilityElement["frame"]>) {
-  const [x, y, width, height] = frame;
-  return [x + width / 2, y + height / 2] as [number, number];
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function tapElement(
@@ -60,26 +61,26 @@ async function recordCall(bundleId: string, pid: number, signal: AbortSignal) {
   console.log(`[auto-call-recorder] 检测到通话界面: ${bundleId} pid ${pid}`);
 
   // 等待通话界面稳定
-  await sleep(800);
+  await sleep(1200);
   if (signal.aborted) return;
 
   // 第一步：点击「更多」
   const moreTapped = await findAndTap(
     { label: MORE_LABEL },
     MORE_LABEL,
-    { timeoutMs: 3000, signal },
+    { timeoutMs: 4000, signal },
   );
   if (!moreTapped) return;
 
   // 等待菜单弹出
-  await sleep(600);
+  await sleep(800);
   if (signal.aborted) return;
 
   // 第二步：点击「通话录音」
   const recordTapped = await findAndTap(
     { label: RECORD_LABEL },
     RECORD_LABEL,
-    { timeoutMs: 3000, signal },
+    { timeoutMs: 4000, signal },
   );
 
   if (recordTapped) {
@@ -87,10 +88,9 @@ async function recordCall(bundleId: string, pid: number, signal: AbortSignal) {
   }
 }
 
-export default defineExtension({
-  async run({ signal }) {
-    console.log("[auto-call-recorder] 服务已启动");
-
+async function watchByApplicationEvents(signal: AbortSignal) {
+  console.log("[auto-call-recorder] 监听应用前台事件");
+  try {
     for await (const event of device.applicationEvents({ signal })) {
       if (!phoneBundleIds.has(event.bundleId)) {
         continue;
@@ -125,6 +125,56 @@ export default defineExtension({
         );
       }
     }
+  } catch (error) {
+    console.error("[auto-call-recorder] applicationEvents 出错:", error);
+  }
+}
+
+async function watchByPolling(signal: AbortSignal) {
+  console.log("[auto-call-recorder] 启动轮询检测（备用）");
+  while (!signal.aborted) {
+    try {
+      const foreground = await device.foregroundApplication.get();
+      const bundleId = foreground?.bundleId ?? "";
+      const pid = foreground?.pid ?? 0;
+
+      if (phoneBundleIds.has(bundleId)) {
+        const key = pid || bundleId;
+        if (!activeCalls.has(key)) {
+          const controller = new AbortController();
+          activeCalls.set(key, controller);
+          recordCall(bundleId, pid, controller.signal).catch((error: Error) => {
+            if (error.name !== "AbortError") {
+              console.error("[auto-call-recorder] 录音失败:", error);
+            }
+          });
+        }
+      } else {
+        // 清理已结束通话
+        for (const [key, controller] of activeCalls) {
+          if (typeof key === "string" || key === pid) {
+            controller.abort();
+            activeCalls.delete(key);
+            console.log(`[auto-call-recorder] 通话结束: ${bundleId}`);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("[auto-call-recorder] 轮询出错:", error);
+    }
+    await sleep(1000);
+  }
+}
+
+export default defineExtension({
+  async run({ signal }) {
+    console.log("[auto-call-recorder] 服务已启动");
+
+    // 同时监听应用事件和轮询前台应用，提高可靠性
+    await Promise.race([
+      watchByApplicationEvents(signal),
+      watchByPolling(signal),
+    ]);
   },
 
   actions: {
