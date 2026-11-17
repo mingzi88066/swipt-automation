@@ -4,8 +4,15 @@ import * as device from "@swipt/api/device";
 import * as fs from "@swipt/api/file-system";
 import { defineAction, defineExtension } from "@swipt/api/swiplet";
 
-// 电话相关 bundleId
-// 注意：iOS 通话界面归属在 com.apple.springboard 下
+// ===== 界面文本（按系统语言调整）=====
+const MORE_LABEL = "更多";
+const RECORD_LABEL = "通话录音";
+const STOP_RECORD_LABEL = "停止通话录音";
+const CALL_APP_LABELS = ["电话", "電話"];
+const CALL_END_LABELS = ["结束", "挂断", "結束", "掛斷"];
+const MUTE_LABELS = ["静音", "靜音"];
+
+// 电话相关 bundleId（iOS 的通话界面归属在 SpringBoard 下）
 const phoneBundleIds = new Set([
   "com.apple.springboard",
   "com.apple.mobilephone",
@@ -16,51 +23,59 @@ const phoneBundleIds = new Set([
   "com.apple.TelephonyUtilities",
 ]);
 
-// 按钮文本
-const MORE_LABEL = "更多";
-const RECORD_LABEL = "通话录音";
-const STOP_RECORD_LABEL = "停止通话录音";
-const CALL_APP_LABEL = "电话";
+// ===== 行为参数 =====
+const STABILIZE_MS = 1200; // 通话界面出现后等待稳定
+const MENU_OPEN_MS = 800; // 点击「更多」后等菜单弹出
+const FIND_TIMEOUT_MS = 5000; // 找按钮的最长等待
+const ATTEMPT_COOLDOWN_MS = 8000; // 一次失败后的冷却
+const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
+const POLL_INTERVAL_MS = 1000; // 轮询间隔
+const LOG_MAX_CHARS = 96 * 1024; // 日志文件上限，超过则截断保留后半段
 
-// 每次通话只触发一次录音
-const activeCalls = new Map<number | string, AbortController>();
+// ===== 通话会话状态（两个监听器共享）=====
+interface CallSession {
+  inCall: boolean; // 当前是否处于通话界面
+  recording: boolean; // 本通电话是否已开启录音
+  attempts: number; // 本通电话已尝试次数
+  lastAttemptAt: number; // 上次尝试时间
+  busy: boolean; // recordCall 是否正在执行
+}
+const session: CallSession = {
+  inCall: false,
+  recording: false,
+  attempts: 0,
+  lastAttemptAt: 0,
+  busy: false,
+};
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ===== 日志：console（可用 swipt device logs 查看）+ 文件（带截断）=====
 async function writeLog(text: string) {
+  console.info(`[auto-call-recorder] ${text}`);
   try {
-    const dir = fs.dataDirectory;
-    const file = dir.file("debug.log");
+    const file = fs.dataDirectory.file("debug.log");
     let existing = "";
     try {
       existing = await file.text();
     } catch {}
-    const timestamp = new Date().toISOString();
-    const entry = `[${timestamp}] ${text}\n`;
+    if (existing.length > LOG_MAX_CHARS) {
+      existing = existing.slice(Math.floor(LOG_MAX_CHARS / 2));
+    }
+    const entry = `[${new Date().toISOString()}] ${text}\n`;
     await file.write(existing + entry);
   } catch (e) {
     console.error("[auto-call-recorder] 写日志失败:", e);
   }
 }
 
-async function dumpScreenToLog(prefix: string) {
-  try {
-    const foreground = await device.foregroundApplication.get();
-    const snapshot = await accessibility.snapshot({ full: true });
-    const lines: string[] = [];
-    lines.push(`--- ${prefix} ---`);
-    lines.push(`前台应用: ${JSON.stringify(foreground)}`);
-    lines.push(`无障碍树:`);
-    collectElements(snapshot.root, 0, lines);
-    await writeLog(lines.join("\n"));
-  } catch (e) {
-    await writeLog(`${prefix} 截取无障碍树失败: ${e}`);
-  }
-}
-
-function collectElements(el: AccessibilityElement, depth: number, out: string[]) {
+function collectElements(
+  el: AccessibilityElement,
+  depth: number,
+  out: string[],
+) {
   const indent = "  ".repeat(depth);
   const parts: string[] = [];
   if (el.role) parts.push(`role=${el.role}`);
@@ -68,230 +83,246 @@ function collectElements(el: AccessibilityElement, depth: number, out: string[])
   if (el.value) parts.push(`value="${el.value}"`);
   if (el.frame) parts.push(`frame=[${el.frame.join(",")}]`);
   if (el.traits?.length) parts.push(`traits=[${el.traits.join(",")}]`);
-  if (parts.length) {
-    out.push(`${indent}${parts.join(" ")}`);
-  }
+  if (parts.length) out.push(`${indent}${parts.join(" ")}`);
   for (const child of el.children) {
     collectElements(child, depth + 1, out);
   }
 }
 
-// 检查当前界面是否为通话界面
+async function dumpScreenToLog(prefix: string) {
+  try {
+    // 通话界面挂在 SpringBoard 覆盖层上，必须用 fullScreen 才能读到
+    const snapshot = await accessibility.snapshot({
+      scope: "fullScreen",
+      full: true,
+    });
+    const foreground = await device.foregroundApplication.get();
+    const lines: string[] = [
+      `--- ${prefix} ---`,
+      `前台应用: ${JSON.stringify(foreground)}`,
+      "无障碍树:",
+    ];
+    collectElements(snapshot.root, 0, lines);
+    await writeLog(lines.join("\n"));
+  } catch (e) {
+    await writeLog(`${prefix} 截取无障碍树失败: ${e}`);
+  }
+}
+
+// ===== 通话界面检测 =====
+async function getCallRoot(): Promise<AccessibilityElement | null> {
+  try {
+    const snapshot = await accessibility.snapshot({
+      scope: "fullScreen",
+      full: true,
+    });
+    return snapshot.root;
+  } catch {
+    return null;
+  }
+}
+
+function hasAnyLabel(el: AccessibilityElement, labels: string[]): boolean {
+  if (el.label !== undefined && labels.includes(el.label)) return true;
+  return el.children.some((child) => hasAnyLabel(child, labels));
+}
+
 async function isCallActive(): Promise<boolean> {
-  try {
-    const snapshot = await accessibility.snapshot({ full: true });
-    const root = snapshot.root;
-
-    // 检查 application label 是否为「电话」
-    if (root.label === CALL_APP_LABEL) {
-      return true;
-    }
-
-    // 检查是否有通话相关按钮
-    const hasCallButtons = hasElement(root, "结束") || hasElement(root, "静音");
-    const hasMoreButton = hasElement(root, MORE_LABEL);
-    if (hasCallButtons && hasMoreButton) {
-      return true;
-    }
-
-    // 检查是否已经在录音（有「停止通话录音」按钮）
-    if (hasElement(root, STOP_RECORD_LABEL)) {
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
-function hasElement(el: AccessibilityElement, label: string): boolean {
-  if (el.label === label) return true;
-  for (const child of el.children) {
-    if (hasElement(child, label)) return true;
+  const root = await getCallRoot();
+  if (root === null) return false;
+  if (root.label !== undefined && CALL_APP_LABELS.includes(root.label)) {
+    return true;
   }
-  return false;
+  const hasEnd = hasAnyLabel(root, CALL_END_LABELS);
+  const hasMute = hasAnyLabel(root, MUTE_LABELS);
+  const hasMore = hasAnyLabel(root, [MORE_LABEL]);
+  // 「结束」+「静音/更多」组合才认定为通话界面，避免普通弹窗误判
+  if ((hasEnd && hasMute) || (hasEnd && hasMore)) return true;
+  return hasAnyLabel(root, [STOP_RECORD_LABEL]);
 }
 
-// 检查是否已经在录音
 async function isAlreadyRecording(): Promise<boolean> {
-  try {
-    const snapshot = await accessibility.snapshot({ full: true });
-    return hasElement(snapshot.root, STOP_RECORD_LABEL);
-  } catch {}
-  return false;
-}
-
-async function tapElement(
-  element: AccessibilityElement,
-  label: string,
-  signal: AbortSignal,
-) {
-  if (!element.frame) {
-    await writeLog(`${label} 没有位置信息`);
-    return false;
-  }
-  await accessibility.tap(element, { signal });
-  await writeLog(`已点击 ${label}`);
-  return true;
+  const root = await getCallRoot();
+  return root !== null && hasAnyLabel(root, [STOP_RECORD_LABEL]);
 }
 
 async function findAndTap(
-  selector: accessibility.AccessibilitySelector,
   label: string,
-  options: { timeoutMs: number; signal: AbortSignal },
-) {
-  await writeLog(`查找 ${label}...`);
-  const element = await accessibility.find(selector, {
-    timeoutMs: options.timeoutMs,
-    poll: true,
-    signal: options.signal,
-  });
-  if (!element) {
-    await writeLog(`未找到 ${label}`);
+  signal: AbortSignal,
+  timeoutMs = FIND_TIMEOUT_MS,
+): Promise<boolean> {
+  const element = await accessibility.find(
+    { label },
+    { timeoutMs, poll: true, signal },
+  );
+  if (element === null) {
+    await writeLog(`未找到「${label}」按钮`);
     return false;
   }
-  return tapElement(element, label, options.signal);
+  try {
+    await accessibility.tap(element, { timeoutMs: 3000, signal });
+  } catch (error) {
+    if (signal.aborted || (error as Error).name === "AbortError") throw error;
+    await writeLog(`点击「${label}」失败: ${error}`);
+    return false;
+  }
+  await writeLog(`已点击「${label}」`);
+  return true;
 }
 
-async function recordCall(bundleId: string, pid: number, signal: AbortSignal) {
-  await writeLog(`检测到通话界面: ${bundleId} pid ${pid}`);
-
-  // 先把当前界面元素写入日志
-  await dumpScreenToLog(`通话开始 ${bundleId}`);
-
-  // 等待通话界面稳定
-  await sleep(1500);
-  if (signal.aborted) return;
-
-  // 检查是否已经在录音了
+// ===== 触发录音，成功返回 true =====
+async function recordCall(signal: AbortSignal): Promise<boolean> {
   if (await isAlreadyRecording()) {
-    await writeLog("已经在录音中，无需重复点击");
-    return;
+    await writeLog("已在录音中，无需重复点击");
+    return true;
   }
 
+  await writeLog("检测到通话界面，准备开启录音");
+  await sleep(STABILIZE_MS);
+  if (signal.aborted) return false;
+
   // 第一步：点击「更多」
-  const moreTapped = await findAndTap(
-    { label: MORE_LABEL },
-    MORE_LABEL,
-    { timeoutMs: 4000, signal },
-  );
-  if (!moreTapped) {
-    await writeLog("「更多」按钮未找到，停止");
-    return;
+  if (!(await findAndTap(MORE_LABEL, signal))) {
+    await dumpScreenToLog("未找到更多按钮时的界面");
+    return false;
   }
 
   // 等待菜单弹出
-  await sleep(800);
-  if (signal.aborted) return;
-
-  // 点击「更多」后再次截图
-  await dumpScreenToLog(`点击更多后`);
+  await sleep(MENU_OPEN_MS);
+  if (signal.aborted) return false;
 
   // 第二步：点击「通话录音」
-  const recordTapped = await findAndTap(
-    { label: RECORD_LABEL },
-    RECORD_LABEL,
-    { timeoutMs: 4000, signal },
-  );
-
-  if (recordTapped) {
-    await writeLog(`自动录音已触发`);
-  } else {
-    await writeLog(`「通话录音」按钮未找到`);
+  if (!(await findAndTap(RECORD_LABEL, signal))) {
+    await dumpScreenToLog("未找到通话录音按钮时的界面");
+    return false;
   }
-}
 
-async function watchByApplicationEvents(signal: AbortSignal) {
-  await writeLog("监听应用前台事件已启动");
+  // 第三步：确认出现「停止通话录音」
   try {
-    for await (const event of device.applicationEvents({ signal })) {
-      if (!phoneBundleIds.has(event.bundleId)) {
-        continue;
-      }
-
-      const running = activeCalls.get(event.pid);
-
-      if (event.type === "background") {
-        if (running) {
-          running.abort();
-          activeCalls.delete(event.pid);
-          await writeLog(`通话结束: ${event.bundleId}`);
-        }
-        continue;
-      }
-
-      if (running) {
-        continue;
-      }
-
-      if (event.type === "foreground" || event.type === "launch") {
-        const controller = new AbortController();
-        activeCalls.set(event.pid, controller);
-
-        recordCall(event.bundleId, event.pid, controller.signal).catch(
-          async (error: Error) => {
-            if (error.name !== "AbortError") {
-              await writeLog(`录音失败: ${error}`);
-            }
-          },
-        );
-      }
+    const confirmed = await accessibility.find(
+      { label: STOP_RECORD_LABEL },
+      { timeoutMs: 3000, poll: true, signal },
+    );
+    if (confirmed !== null) {
+      await writeLog("录音已开启 ✅");
+      return true;
     }
   } catch (error) {
-    await writeLog(`applicationEvents 出错: ${error}`);
+    if (signal.aborted || (error as Error).name === "AbortError") throw error;
+  }
+  // 菜单可能已收起导致确认按钮读不到，视为已点击
+  await writeLog("已点击「通话录音」（未读到确认按钮，请留意设备）");
+  return true;
+}
+
+// ===== 状态机：检测 + 触发（幂等，可被事件/轮询同时调用）=====
+async function maybeHandle(signal: AbortSignal) {
+  let active: boolean;
+  try {
+    active = await isCallActive();
+  } catch {
+    return;
+  }
+
+  if (!active) {
+    if (session.inCall) {
+      session.inCall = false;
+      session.recording = false;
+      session.attempts = 0;
+      await writeLog("通话结束");
+    }
+    return;
+  }
+
+  session.inCall = true;
+  if (session.recording || session.busy) return;
+  if (session.attempts >= MAX_ATTEMPTS_PER_CALL) return;
+  if (Date.now() - session.lastAttemptAt < ATTEMPT_COOLDOWN_MS) return;
+
+  session.busy = true;
+  session.attempts++;
+  session.lastAttemptAt = Date.now();
+  try {
+    session.recording = await recordCall(signal);
+    if (!session.recording) {
+      await writeLog(
+        `第 ${session.attempts}/${MAX_ATTEMPTS_PER_CALL} 次尝试未成功`,
+      );
+    }
+  } catch (error) {
+    if ((error as Error).name !== "AbortError") {
+      await writeLog(`触发录音失败: ${error}`);
+    }
+  } finally {
+    session.busy = false;
   }
 }
 
-async function watchByPolling(signal: AbortSignal) {
-  await writeLog("轮询检测已启动（备用）");
-  let wasCallActive = false;
+// ===== 监听器一：应用前后台事件（快速唤醒）=====
+async function watchByApplicationEvents(signal: AbortSignal) {
+  await writeLog("应用事件监听已启动");
+  for await (const event of device.applicationEvents({ signal })) {
+    if (signal.aborted) return;
+    if (!phoneBundleIds.has(event.bundleId)) continue;
+    // 事件只做唤醒，是否真的是通话界面由 maybeHandle 内部验证
+    await maybeHandle(signal);
+  }
+}
 
+// ===== 监听器二：轮询兜底（事件丢失/不支持时也能工作）=====
+async function watchByPolling(signal: AbortSignal) {
+  await writeLog("轮询检测已启动");
   while (!signal.aborted) {
     try {
-      const callActive = await isCallActive();
-
-      if (callActive && !wasCallActive) {
-        // 通话刚开始
-        const foreground = await device.foregroundApplication.get();
-        const bundleId = foreground?.bundleId ?? "unknown";
-        const pid = foreground?.pid ?? 0;
-        const key = pid || bundleId;
-
-        if (!activeCalls.has(key)) {
-          const controller = new AbortController();
-          activeCalls.set(key, controller);
-          wasCallActive = true;
-
-          recordCall(bundleId, pid, controller.signal).catch(
-            async (error: Error) => {
-              if (error.name !== "AbortError") {
-                await writeLog(`录音失败: ${error}`);
-              }
-            },
-          );
-        }
-      } else if (!callActive && wasCallActive) {
-        // 通话结束
-        wasCallActive = false;
-        for (const [key, controller] of activeCalls) {
-          controller.abort();
-          activeCalls.delete(key);
-          await writeLog(`通话结束（轮询检测）`);
-        }
-      }
+      await maybeHandle(signal);
     } catch (error) {
       await writeLog(`轮询出错: ${error}`);
     }
-    await sleep(1000);
+    await sleep(POLL_INTERVAL_MS);
   }
+}
+
+function simplifyTree(
+  element: AccessibilityElement,
+  depth = 0,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  if (element.role) result.role = element.role;
+  if (element.label) result.label = element.label;
+  if (element.value) result.value = element.value;
+  if (element.frame) result.frame = element.frame;
+  if (element.traits?.length) result.traits = element.traits;
+  if (element.children.length && depth < 3) {
+    result.children = element.children.map((child) =>
+      simplifyTree(child, depth + 1),
+    );
+  }
+  return result;
 }
 
 export default defineExtension({
   async run({ signal }) {
     await writeLog("========== 服务已启动 ==========");
 
-    // 同时监听应用事件和轮询前台应用
-    await Promise.race([
-      watchByApplicationEvents(signal),
-      watchByPolling(signal),
+    // 守护：任一监听器意外退出都自动重启，服务不再悄悄死掉
+    const supervise = async (name: string, task: () => Promise<void>) => {
+      while (!signal.aborted) {
+        try {
+          await task();
+          if (signal.aborted) return;
+          await writeLog(`${name}已退出，5 秒后重启`);
+        } catch (error) {
+          if (signal.aborted || (error as Error).name === "AbortError") return;
+          await writeLog(`${name}出错: ${error}`);
+        }
+        await sleep(5000);
+      }
+    };
+
+    // 两个监听器并行（不是 race，谁出问题都不会拖垮另一个）
+    await Promise.all([
+      supervise("事件监听", () => watchByApplicationEvents(signal)),
+      supervise("轮询检测", () => watchByPolling(signal)),
     ]);
   },
 
@@ -300,7 +331,10 @@ export default defineExtension({
       title: "Inspect Current Screen",
       description: "打印当前无障碍树，用于调试",
       run: async () => {
-        const snapshot = await accessibility.snapshot({ full: true });
+        const snapshot = await accessibility.snapshot({
+          scope: "fullScreen",
+          full: true,
+        });
         const foreground = await device.foregroundApplication.get();
         await dumpScreenToLog("inspect 动作");
         return {
@@ -315,10 +349,10 @@ export default defineExtension({
       description: "立即尝试点击当前通话界面的录音按钮",
       run: async () => {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
+        const timeout = setTimeout(() => controller.abort(), 15_000);
         try {
-          await recordCall("manual", 0, controller.signal);
-          return { ok: true };
+          const ok = await recordCall(controller.signal);
+          return { ok };
         } finally {
           clearTimeout(timeout);
         }
@@ -331,8 +365,7 @@ export default defineExtension({
       run: async () => {
         try {
           const file = fs.dataDirectory.file("debug.log");
-          const text = await file.text();
-          return { log: text };
+          return { log: await file.text() };
         } catch {
           return { log: "(日志文件不存在)" };
         }
@@ -344,8 +377,7 @@ export default defineExtension({
       description: "清空调试日志文件",
       run: async () => {
         try {
-          const file = fs.dataDirectory.file("debug.log");
-          await file.write("");
+          await fs.dataDirectory.file("debug.log").write("");
           return { cleared: true };
         } catch {
           return { cleared: false };
@@ -354,18 +386,3 @@ export default defineExtension({
     }),
   },
 });
-
-function simplifyTree(element: AccessibilityElement, depth = 0): unknown {
-  const result: Record<string, unknown> = {};
-  if (element.role) result.role = element.role;
-  if (element.label) result.label = element.label;
-  if (element.value) result.value = element.value;
-  if (element.frame) result.frame = element.frame;
-  if (element.traits?.length) result.traits = element.traits;
-  if (element.children.length && depth < 3) {
-    result.children = element.children.map((child) =>
-      simplifyTree(child, depth + 1),
-    );
-  }
-  return result;
-}

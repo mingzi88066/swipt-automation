@@ -23,6 +23,7 @@
     "check": "tsc"
   },
   "devDependencies": {
+    "@expo/ui": "~58.0.26",
     "@swipt/api": "0.1.0-nightly.90",
     "@swipt/cli": "0.1.0-nightly.90",
     "@types/react": "~19.3.0",

@@ -4,10 +4,17 @@
 
 ## 工作原理
 
-1. 以后台 Service 形式运行，监听 `applicationEvents`
-2. 当检测到电话应用（`com.apple.mobilephone`、`com.apple.InCallService` 等）进入前台时触发
-3. 自动点击「更多」按钮
-4. 在弹出的菜单中点击「通话录音」
+1. 以后台 Service 形式运行，**事件监听 + 轮询兜底**双通道检测：
+   - 监听 `applicationEvents`（电话/通话相关 bundleId 进前台时唤醒）
+   - 同时每秒轮询一次无障碍快照（`scope: "fullScreen"`，能读到挂在 SpringBoard 上的通话界面）
+2. 检测逻辑：界面同时出现「结束/挂断」+「静音/更多」才认定为通话界面，避免普通弹窗误判
+3. 自动点击「更多」按钮，再点击「通话录音」
+4. 每通电话最多尝试 3 次（间隔 8 秒），已开启录音不会重复点击
+5. 两个监听器由守护逻辑看护，任一异常退出会在 5 秒后自动重启，服务不会悄悄停止
+
+### App 内开关
+
+Swiplet 自带界面里有「启用自动录音」开关和服务状态显示（启动中/运行中/已停止/出错）。
 
 ## 文件结构
 
@@ -45,6 +52,12 @@ swipt swiplet service enable auto-call-recorder
 
 ### 3. 调试
 
+实时日志（推荐，`console.info` 会输出到设备日志）：
+
+```bash
+swipt device logs --follow --swiplet auto-call-recorder
+```
+
 首次使用前，建议先确认界面元素文本和 bundleId 是否正确：
 
 ```bash
@@ -65,24 +78,33 @@ swipt swiplet call auto-call-recorder inspect
 swipt swiplet call auto-call-recorder triggerOnce
 ```
 
+调试日志同时会写入设备上的 `debug.log`（自动截断到 96 KB），读取：
+
+```bash
+swipt swiplet call auto-call-recorder readLog
+```
+
 ## 常见问题
 
 ### Q: 为什么没有自动触发？
 
 1. 检查服务是否已启用：`swipt swiplet service watch auto-call-recorder`
-2. 检查 bundleId 是否正确：先运行 `inspect` 动作
-3. 检查按钮文本是否匹配：不同 iOS 版本或语言可能不同
-4. 检查 Swipt 的无障碍权限是否已开启
+2. 检查按钮文本是否匹配：先运行 `inspect` 动作，看通话界面的实际 label
+3. 检查 Swipt 的无障碍权限是否已开启（设置 → 辅助功能）
+4. 看实时日志：`swipt device logs --follow --swiplet auto-call-recorder`
+5. 无障碍 API 需要 **iOS 26+**，更低版本无法使用本 Swiplet
 
 ### Q: 会不会在每次切到电话应用都触发？
 
-代码里通过 `pid` 做了去重，同一个通话进程只会触发一次。
+不会。只有界面同时出现「结束/挂断」+「静音/更多」等通话特征按钮时才会触发，且回到主屏等 SpringBoard 前台事件会先经过通话界面验证，不会盲目点击。
 
 ### Q: 接听电话时也能触发吗？
 
-当前逻辑会在电话应用进入前台时触发。如果是接听来电，电话应用同样会进入前台，因此也会触发。
+来电接听、去电都会触发。检测到界面后会先等 1.2 秒让界面稳定，再执行点击。
 
-但如果你希望在「接通后」才触发（而不是响铃时就触发），需要额外判断通话状态，目前 API 中没有直接获取通话状态的方法，可以通过检测计时器是否出现（`00:00` 或 `00:01`）作为启发式判断。
+### Q: 服务跑一会儿就不工作了？
+
+旧版本里两个监听器用 `Promise.race` 并联，任一出错整个服务会静默停止。现已改为守护模式：监听器异常退出后 5 秒自动重启。如果你还在用旧版，重新 `swipt project deploy` 一次。
 
 ## 自定义
 
