@@ -1,0 +1,4 @@
+node_modules/
+dist/
+*.swiplet
+.DS_Store
