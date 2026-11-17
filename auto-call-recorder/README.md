@@ -30,6 +30,26 @@ auto-call-recorder/
 
 ## 安装步骤
 
+### 方式 A：在手机 Linux 虚拟机里一键安装（无需电脑）
+
+适用于 iPhone 上运行 LinuxRunner / Debian 虚拟机的情况。在虚拟机终端里执行：
+
+```bash
+curl -fsSL -o install-on-phone.sh https://raw.githubusercontent.com/mingzi88066/swipt-automation/main/install-on-phone.sh
+sh install-on-phone.sh
+```
+
+脚本会自动：安装 Node 22（CLI 在 Node 20 上会崩溃）→ 安装 Swipt CLI → 连接本机 Swipt（`http://10.7.0.1:29937`，走 Loopback VPN）→ 下载并安装 `releases/auto-call-recorder.swiplet` → 启用服务。
+
+注意事项：
+
+- 前提：手机上 Loopback VPN（LocalDevVPN）已开启、Swipt App 已完成初始设置
+- 虚拟机里 Node 20 会报 `Iterator is not defined`——这是 CLI 要求 Node 22+，脚本已处理
+- 如果 `10.7.0.1` 连不上，改用手机局域网 IP：`DEVICE_URL=http://192.168.x.x:29937 sh install-on-phone.sh`
+- 命令是 `swipt`，不是 `swift`（容易打错）
+
+### 方式 B：用 Mac / 电脑安装
+
 ### 1. 安装依赖
 
 ```bash
