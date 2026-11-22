@@ -4,24 +4,30 @@ import * as device from "@swipt/api/device";
 import * as fs from "@swipt/api/file-system";
 import { defineAction, defineExtension } from "@swipt/api/swiplet";
 
-// ===== 界面文本（简体 / 繁体系统都要认）=====
-// 注意：「停止通话录音」里也含「通话录音」，所以两套文案必须分开匹配，
-// 否则会把"正在录音"的按钮当成"开启录音"再点一次（等于把录音关掉）。
-const MORE_LABELS = ["更多"];
-const RECORD_LABELS = ["通话录音", "通話錄音", "录音", "錄音"];
-const STOP_RECORD_LABELS = [
-  "停止通话录音",
-  "停止通話錄音",
-  "停止录音",
-  "停止錄音",
-  "停止",
-];
-const CALL_APP_LABELS = ["电话", "電話", "Phone"];
-const CALL_END_LABELS = ["结束", "挂断", "結束", "掛斷", "结束通话", "結束通話"];
-const MUTE_LABELS = ["静音", "靜音"];
+// ===== 界面文案匹配（简体 / 繁体 / 带副标题都要认）=====
+// iOS 的菜单行会把副标题并进无障碍 label，例如「通話錄音，轉寫和生成摘要」，
+// 精确相等匹配会漏点，所以这里一律用「包含」判断。
+type LabelTest = (label: string) => boolean;
 
-const MORE_SELECTORS = MORE_LABELS.map((label) => ({ label }));
-const RECORD_SELECTORS = RECORD_LABELS.map((label) => ({ label }));
+const isMoreLabel: LabelTest = (label) => label.includes("更多");
+const isRecordLabel: LabelTest = (label) =>
+  /(通话录音|通話錄音|录音|錄音)/.test(label) && !label.includes("停止");
+const isStopRecordLabel: LabelTest = (label) =>
+  label.trim() === "停止" ||
+  (label.includes("停止") && /(录音|錄音)/.test(label));
+const isCallEndLabel: LabelTest = (label) => /(结束|挂断|結束|掛斷)/.test(label);
+const isMuteLabel: LabelTest = (label) => /(静音|靜音)/.test(label);
+const isCallAppLabel: LabelTest = (label) => /^(电话|電話|Phone)$/.test(label);
+
+// 空闲挂起的锚点交给 accessibility.find，只支持精确匹配，所以简繁两种都列上
+const CALL_ANCHOR_SELECTORS = [
+  { label: "结束" },
+  { label: "結束" },
+  { label: "挂断" },
+  { label: "掛斷" },
+  { label: "结束通话" },
+  { label: "結束通話" },
+];
 
 // 电话相关 bundleId（iOS 的通话界面归属在 SpringBoard 下）
 const phoneBundleIds = new Set([
@@ -40,15 +46,14 @@ const MENU_OPEN_MS = 800; // 点击「更多」后等菜单弹出
 const FIND_TIMEOUT_MS = 5000; // 找按钮的最长等待
 const ATTEMPT_COOLDOWN_MS = 8000; // 一次失败后的冷却
 const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
+const RECORD_TAP_RETRIES = 3; // 点「通话录音」没生效时的重试次数
+const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 
-// ===== 性能参数（1.0.3：点完录音立即挂起，不再监测通话结束）=====
+// ===== 性能参数（1.0.4：点完录音立即挂起，不再监测通话结束）=====
 const QUIET_WATCHDOG_MS = 120_000; // 挂起时的兜底唤醒（仅 1 次读屏 / 2 分钟）
 const FALSE_HIT_BACKOFF_MS = 1500; // 误判后重新挂起等待的间隔
 const LOG_MAX_CHARS = 32 * 1024;
 const LOG_FLUSH_MS = 2000;
-
-// 通话界面的"锚点"元素：只有进入通话才会出现
-const CALL_ANCHOR_SELECTORS = CALL_END_LABELS.map((label) => ({ label }));
 
 // ===== 通话会话状态 =====
 // quiet：挂起原因。非 null 表示当前完全不读屏，只等事件 / 看门狗唤醒。
@@ -174,31 +179,66 @@ async function dumpScreenToLog(prefix: string) {
   }
 }
 
-// ===== 判定：当前是否通话界面 =====
-function hasAnyLabel(el: AccessibilityElement, labels: readonly string[]): boolean {
-  if (el.label !== undefined && labels.includes(el.label)) return true;
-  return el.children.some((child) => hasAnyLabel(child, labels));
+// ===== 文案查找 / 判定 =====
+function hasLabel(el: AccessibilityElement, test: LabelTest): boolean {
+  if (el.label !== undefined && test(el.label)) return true;
+  return el.children.some((child) => hasLabel(child, test));
+}
+
+function collectLabeled(
+  el: AccessibilityElement,
+  test: LabelTest,
+  out: AccessibilityElement[] = [],
+): AccessibilityElement[] {
+  if (el.label !== undefined && test(el.label)) out.push(el);
+  for (const child of el.children) collectLabeled(child, test, out);
+  return out;
+}
+
+function collectLabels(el: AccessibilityElement, out: string[] = []): string[] {
+  if (el.label) out.push(el.label);
+  for (const child of el.children) collectLabels(child, out);
+  return out;
+}
+
+function frameArea(el: AccessibilityElement): number {
+  const frame = el.frame;
+  return frame ? frame[2] * frame[3] : 0;
+}
+
+// 同一行文案常有多层元素带相同 label（按钮 / 文字 / 图标），
+// 优先点 traits 带 button 的最小元素，命中率最高。
+function pickTappable(
+  matches: AccessibilityElement[],
+): AccessibilityElement | null {
+  const buttons = matches.filter((el) => el.traits?.includes("button"));
+  const pool = buttons.length > 0 ? buttons : matches;
+  let best: AccessibilityElement | null = null;
+  for (const el of pool) {
+    if (best === null) {
+      best = el;
+      continue;
+    }
+    const area = frameArea(el);
+    if (area > 0 && (area < frameArea(best) || frameArea(best) === 0)) best = el;
+  }
+  return best;
+}
+
+async function readScreen() {
+  return accessibility.snapshot({ scope: "fullScreen", full: true });
 }
 
 // 只在确认要判定时调用（进入通话锚点后），不在空闲时调用
 async function isCallScreen(): Promise<boolean> {
   try {
-    const snapshot = await accessibility.snapshot({
-      scope: "fullScreen",
-      full: true,
-    });
-    const root = snapshot.root;
-    if (root.label !== undefined && CALL_APP_LABELS.includes(root.label)) {
-      return true;
+    const root = (await readScreen()).root;
+    if (root.label !== undefined && isCallAppLabel(root.label)) return true;
+    if (!hasLabel(root, isCallEndLabel)) {
+      return hasLabel(root, isStopRecordLabel);
     }
-    const hasEnd = hasAnyLabel(root, CALL_END_LABELS);
-    if (!hasEnd) {
-      return hasAnyLabel(root, STOP_RECORD_LABELS);
-    }
-    const hasMute = hasAnyLabel(root, MUTE_LABELS);
-    const hasMore = hasAnyLabel(root, MORE_LABELS);
-    if (hasMute || hasMore) return true;
-    return hasAnyLabel(root, STOP_RECORD_LABELS);
+    if (hasLabel(root, isMuteLabel) || hasLabel(root, isMoreLabel)) return true;
+    return hasLabel(root, isStopRecordLabel);
   } catch {
     return false;
   }
@@ -206,31 +246,56 @@ async function isCallScreen(): Promise<boolean> {
 
 async function isAlreadyRecording(): Promise<boolean> {
   try {
-    const snapshot = await accessibility.snapshot({
-      scope: "fullScreen",
-      full: true,
-    });
-    return hasAnyLabel(snapshot.root, STOP_RECORD_LABELS);
+    return hasLabel((await readScreen()).root, isStopRecordLabel);
   } catch {
     return false;
   }
 }
 
-async function findAndTap(
-  selectors: readonly { label: string }[],
+// 录音 UI 的三种状态：正在录音 / 「更多」菜单还开着 / 两者都没有
+type RecordUiState = "recording" | "menu" | "plain";
+
+async function readRecordUiState(): Promise<RecordUiState> {
+  try {
+    const root = (await readScreen()).root;
+    if (hasLabel(root, isStopRecordLabel)) return "recording";
+    if (hasLabel(root, isRecordLabel)) return "menu";
+    return "plain";
+  } catch {
+    return "plain";
+  }
+}
+
+// 找可点元素：只在点击那一刻轮询快照，几秒内结束
+async function waitForLabeled(
+  test: LabelTest,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<AccessibilityElement | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const picked = pickTappable(
+        collectLabeled((await readScreen()).root, test),
+      );
+      if (picked !== null) return picked;
+    } catch (error) {
+      if (signal.aborted || (error as Error).name === "AbortError") throw error;
+    }
+    if (Date.now() >= deadline) return null;
+    await sleep(350, { signal });
+  }
+}
+
+async function tapByLabel(
+  test: LabelTest,
   name: string,
   signal: AbortSignal,
   timeoutMs = FIND_TIMEOUT_MS,
 ): Promise<boolean> {
-  const element = await accessibility.find(selectors, {
-    timeoutMs,
-    poll: true,
-    signal,
-  });
+  const element = await waitForLabeled(test, signal, timeoutMs);
   if (element === null) {
-    await writeLog(
-      `未找到「${name}」按钮（已尝试: ${selectors.map((s) => s.label).join(" / ")}）`,
-    );
+    await writeLog(`未找到「${name}」按钮`);
     return false;
   }
   try {
@@ -255,26 +320,32 @@ async function recordCall(signal: AbortSignal): Promise<boolean> {
   await sleep(STABILIZE_MS, { signal });
   if (signal.aborted) return false;
 
-  for (let round = 0; round < 2; round++) {
-    if (!(await findAndTap(MORE_SELECTORS, "更多", signal))) {
-      await dumpScreenToLog("未找到更多按钮时的界面");
-      return false;
-    }
-
-    await sleep(MENU_OPEN_MS, { signal });
-    if (signal.aborted) return false;
-
-    // 点完就结束：不确认录音状态，也不等通话结束
-    if (await findAndTap(RECORD_SELECTORS, "通话录音", signal, 4000)) {
-      return true;
-    }
-
-    if (round === 0) {
-      await writeLog("菜单未出现，重试点击「更多」");
-    }
+  if (!(await tapByLabel(isMoreLabel, "更多", signal))) {
+    await dumpScreenToLog("未找到更多按钮时的界面");
+    return false;
   }
 
-  await dumpScreenToLog("未找到通话录音按钮时的界面");
+  await sleep(MENU_OPEN_MS, { signal });
+  if (signal.aborted) return false;
+
+  // 点「通话录音 / 通話錄音」：只看一眼这次点击有没有落到按钮上（菜单是否收起），
+  // 不确认录音是否真的在跑，更不会去等通话结束。
+  for (let attempt = 0; attempt < RECORD_TAP_RETRIES; attempt++) {
+    if (!(await tapByLabel(isRecordLabel, "通话录音/通話錄音", signal, 4000))) {
+      break;
+    }
+    await sleep(RECORD_CONFIRM_MS, { signal });
+    const state = await readRecordUiState();
+    if (state !== "menu") {
+      await writeLog(
+        state === "recording" ? "录音已开启 ✅" : "菜单已收起，视为已触发录音",
+      );
+      return true;
+    }
+    await writeLog(`第 ${attempt + 1} 次点击后菜单仍在，重试`);
+  }
+
+  await dumpScreenToLog("点击通话录音未生效时的界面");
   return false;
 }
 
@@ -384,7 +455,9 @@ async function handleCallIfAny(signal: AbortSignal): Promise<boolean> {
       session.quiet = "recording";
       await writeLog("录音已触发，直接挂起（不再监测通话是否结束）");
     } else {
-      await writeLog(`第 ${session.attempts}/${MAX_ATTEMPTS_PER_CALL} 次尝试未成功`);
+      await writeLog(
+        `第 ${session.attempts}/${MAX_ATTEMPTS_PER_CALL} 次尝试未成功`,
+      );
       if (session.attempts >= MAX_ATTEMPTS_PER_CALL) {
         session.quiet = "exhausted";
         await writeLog("本通电话暂不重试，挂起等待唤醒");
@@ -403,7 +476,7 @@ async function handleCallIfAny(signal: AbortSignal): Promise<boolean> {
 
 // ===== 唯一的执行循环：挂起等待 → 命中 → 处理 → 再挂起 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（1.0.3：点完录音立即挂起）");
+  await writeLog("通话监听已启动（1.0.4：简繁识别 + 点完即挂起）");
   while (!signal.aborted) {
     if (session.quiet !== null) {
       await waitForWake(signal);
@@ -454,7 +527,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.3) ==========");
+    await writeLog("========== 服务已启动 (1.0.4) ==========");
 
     const supervise = async (name: string, task: () => Promise<void>) => {
       while (!signal.aborted) {
@@ -496,12 +569,24 @@ export default defineExtension({
       },
     }),
 
+    labels: defineAction({
+      title: "List Labels",
+      description: "列出当前屏幕上所有文案，便于核对按钮文本",
+      run: async () => {
+        try {
+          return { labels: collectLabels((await readScreen()).root) };
+        } catch (e) {
+          return { labels: [], error: String(e) };
+        }
+      },
+    }),
+
     triggerOnce: defineAction({
       title: "Trigger Once",
       description: "立即尝试点击当前通话界面的录音按钮",
       run: async () => {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15_000);
+        const timeout = setTimeout(() => controller.abort(), 20_000);
         try {
           const ok = await recordCall(controller.signal);
           return { ok };
