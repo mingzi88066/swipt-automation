@@ -4,13 +4,24 @@ import * as device from "@swipt/api/device";
 import * as fs from "@swipt/api/file-system";
 import { defineAction, defineExtension } from "@swipt/api/swiplet";
 
-// ===== 界面文本（按系统语言调整）=====
-const MORE_LABEL = "更多";
-const RECORD_LABEL = "通话录音";
-const STOP_RECORD_LABEL = "停止通话录音";
-const CALL_APP_LABELS = ["电话", "電話"];
-const CALL_END_LABELS = ["结束", "挂断", "結束", "掛斷"];
+// ===== 界面文本（简体 / 繁体系统都要认）=====
+// 注意：「停止通话录音」里也含「通话录音」，所以两套文案必须分开匹配，
+// 否则会把"正在录音"的按钮当成"开启录音"再点一次（等于把录音关掉）。
+const MORE_LABELS = ["更多"];
+const RECORD_LABELS = ["通话录音", "通話錄音", "录音", "錄音"];
+const STOP_RECORD_LABELS = [
+  "停止通话录音",
+  "停止通話錄音",
+  "停止录音",
+  "停止錄音",
+  "停止",
+];
+const CALL_APP_LABELS = ["电话", "電話", "Phone"];
+const CALL_END_LABELS = ["结束", "挂断", "結束", "掛斷", "结束通话", "結束通話"];
 const MUTE_LABELS = ["静音", "靜音"];
+
+const MORE_SELECTORS = MORE_LABELS.map((label) => ({ label }));
+const RECORD_SELECTORS = RECORD_LABELS.map((label) => ({ label }));
 
 // 电话相关 bundleId（iOS 的通话界面归属在 SpringBoard 下）
 const phoneBundleIds = new Set([
@@ -30,8 +41,8 @@ const FIND_TIMEOUT_MS = 5000; // 找按钮的最长等待
 const ATTEMPT_COOLDOWN_MS = 8000; // 一次失败后的冷却
 const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
 
-// ===== 性能参数（1.0.2：空闲时完全不轮询）=====
-const IN_CALL_POLL_MS = 1000; // 仅在通话进行中轮询（用于发现通话结束）
+// ===== 性能参数（1.0.3：点完录音立即挂起，不再监测通话结束）=====
+const QUIET_WATCHDOG_MS = 120_000; // 挂起时的兜底唤醒（仅 1 次读屏 / 2 分钟）
 const FALSE_HIT_BACKOFF_MS = 1500; // 误判后重新挂起等待的间隔
 const LOG_MAX_CHARS = 32 * 1024;
 const LOG_FLUSH_MS = 2000;
@@ -40,23 +51,49 @@ const LOG_FLUSH_MS = 2000;
 const CALL_ANCHOR_SELECTORS = CALL_END_LABELS.map((label) => ({ label }));
 
 // ===== 通话会话状态 =====
+// quiet：挂起原因。非 null 表示当前完全不读屏，只等事件 / 看门狗唤醒。
+//  - "recording"：本通已点过录音，等下一通电话
+//  - "exhausted"：本通重试次数用尽，唤醒后允许再试一次
+type QuietReason = "recording" | "exhausted";
 interface CallSession {
-  inCall: boolean;
-  recording: boolean;
+  recording: boolean; // 本通电话已点过录音
+  quiet: QuietReason | null; // 挂起中
   attempts: number;
   lastAttemptAt: number;
   busy: boolean;
 }
 const session: CallSession = {
-  inCall: false,
   recording: false,
+  quiet: null,
   attempts: 0,
   lastAttemptAt: 0,
   busy: false,
 };
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function abortError(): Error {
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function sleep(ms: number, options?: { signal?: AbortSignal }): Promise<void> {
+  const signal = options?.signal;
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const onAbort = () => {
+      if (timer !== null) clearTimeout(timer);
+      reject(abortError());
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 // ===== 日志：内存缓冲 + 定时落盘 =====
@@ -138,7 +175,7 @@ async function dumpScreenToLog(prefix: string) {
 }
 
 // ===== 判定：当前是否通话界面 =====
-function hasAnyLabel(el: AccessibilityElement, labels: string[]): boolean {
+function hasAnyLabel(el: AccessibilityElement, labels: readonly string[]): boolean {
   if (el.label !== undefined && labels.includes(el.label)) return true;
   return el.children.some((child) => hasAnyLabel(child, labels));
 }
@@ -156,12 +193,12 @@ async function isCallScreen(): Promise<boolean> {
     }
     const hasEnd = hasAnyLabel(root, CALL_END_LABELS);
     if (!hasEnd) {
-      return hasAnyLabel(root, [STOP_RECORD_LABEL]);
+      return hasAnyLabel(root, STOP_RECORD_LABELS);
     }
     const hasMute = hasAnyLabel(root, MUTE_LABELS);
-    const hasMore = hasAnyLabel(root, [MORE_LABEL]);
+    const hasMore = hasAnyLabel(root, MORE_LABELS);
     if (hasMute || hasMore) return true;
-    return hasAnyLabel(root, [STOP_RECORD_LABEL]);
+    return hasAnyLabel(root, STOP_RECORD_LABELS);
   } catch {
     return false;
   }
@@ -173,33 +210,37 @@ async function isAlreadyRecording(): Promise<boolean> {
       scope: "fullScreen",
       full: true,
     });
-    return hasAnyLabel(snapshot.root, [STOP_RECORD_LABEL]);
+    return hasAnyLabel(snapshot.root, STOP_RECORD_LABELS);
   } catch {
     return false;
   }
 }
 
 async function findAndTap(
-  label: string,
+  selectors: readonly { label: string }[],
+  name: string,
   signal: AbortSignal,
   timeoutMs = FIND_TIMEOUT_MS,
 ): Promise<boolean> {
-  const element = await accessibility.find(
-    { label },
-    { timeoutMs, poll: true, signal },
-  );
+  const element = await accessibility.find(selectors, {
+    timeoutMs,
+    poll: true,
+    signal,
+  });
   if (element === null) {
-    await writeLog(`未找到「${label}」按钮`);
+    await writeLog(
+      `未找到「${name}」按钮（已尝试: ${selectors.map((s) => s.label).join(" / ")}）`,
+    );
     return false;
   }
   try {
     await accessibility.tap(element, { timeoutMs: 3000, signal });
   } catch (error) {
     if (signal.aborted || (error as Error).name === "AbortError") throw error;
-    await writeLog(`点击「${label}」失败: ${error}`);
+    await writeLog(`点击「${element.label ?? name}」失败: ${error}`);
     return false;
   }
-  await writeLog(`已点击「${label}」`);
+  await writeLog(`已点击「${element.label ?? name}」`);
   return true;
 }
 
@@ -211,34 +252,20 @@ async function recordCall(signal: AbortSignal): Promise<boolean> {
   }
 
   await writeLog("检测到通话界面，准备开启录音");
-  await sleep(STABILIZE_MS);
+  await sleep(STABILIZE_MS, { signal });
   if (signal.aborted) return false;
 
   for (let round = 0; round < 2; round++) {
-    if (!(await findAndTap(MORE_LABEL, signal))) {
+    if (!(await findAndTap(MORE_SELECTORS, "更多", signal))) {
       await dumpScreenToLog("未找到更多按钮时的界面");
       return false;
     }
 
-    await sleep(MENU_OPEN_MS);
+    await sleep(MENU_OPEN_MS, { signal });
     if (signal.aborted) return false;
 
-    if (await findAndTap(RECORD_LABEL, signal, 4000)) {
-      try {
-        const confirmed = await accessibility.find(
-          { label: STOP_RECORD_LABEL },
-          { timeoutMs: 3000, poll: true, signal },
-        );
-        if (confirmed !== null) {
-          await writeLog("录音已开启 ✅");
-          return true;
-        }
-      } catch (error) {
-        if (signal.aborted || (error as Error).name === "AbortError") {
-          throw error;
-        }
-      }
-      await writeLog("已点击「通话录音」（未读到确认按钮，请留意设备）");
+    // 点完就结束：不确认录音状态，也不等通话结束
+    if (await findAndTap(RECORD_SELECTORS, "通话录音", signal, 4000)) {
       return true;
     }
 
@@ -251,7 +278,7 @@ async function recordCall(signal: AbortSignal): Promise<boolean> {
   return false;
 }
 
-// ===== 空闲等待：不轮询，靠系统"屏幕推送"唤醒 =====
+// ===== 空闲/挂起等待：不轮询，靠系统"屏幕推送"与前台事件唤醒 =====
 // accessibility.find 不带 poll 时，一次读取后挂起等待下一次屏幕变化推送，
 // 静止的桌面上几乎不产生任何读取，这是"只在通话界面时运行"的关键。
 let waitController: AbortController | null = null;
@@ -280,70 +307,117 @@ async function waitForCallAnchor(signal: AbortSignal): Promise<void> {
   }
 }
 
-// 通话进行中：只有这时候才轮询，用于发现通话结束
-async function watchCallUntilEnd(signal: AbortSignal) {
-  while (!signal.aborted) {
-    if (!(await isCallScreen())) {
-      session.inCall = false;
-      session.recording = false;
-      session.attempts = 0;
-      await writeLog("通话结束");
-      return;
-    }
-    await sleep(IN_CALL_POLL_MS);
+// ===== 点完录音后的"挂起" =====
+// 不读屏、不轮询：只等电话类 App 的前台事件（下一通电话一定会触发），
+// 外加一个很长的看门狗兜底，防止事件丢失后永久卡住。
+let wakeUp: (() => void) | null = null;
+
+function signalPhoneActivity() {
+  const resolve = wakeUp;
+  wakeUp = null;
+  resolve?.();
+}
+
+async function waitForWake(signal: AbortSignal): Promise<void> {
+  const wake = new Promise<void>((resolve) => {
+    wakeUp = resolve;
+  });
+  const watchdog = sleep(QUIET_WATCHDOG_MS, { signal }).catch(() => undefined);
+  try {
+    await Promise.race([wake, watchdog]);
+  } finally {
+    if (wakeUp !== null) wakeUp = null;
   }
 }
 
 // 命中锚点后走一次判定 + 触发流程；返回 true 表示确实处理了一通电话
 async function handleCallIfAny(signal: AbortSignal): Promise<boolean> {
-  if (!(await isCallScreen())) return false;
-
-  session.inCall = true;
-  const recentAttempt =
-    Date.now() - session.lastAttemptAt < ATTEMPT_COOLDOWN_MS;
-
-  if (
-    !session.recording &&
-    !session.busy &&
-    session.attempts < MAX_ATTEMPTS_PER_CALL &&
-    !recentAttempt
-  ) {
-    session.busy = true;
-    session.attempts++;
-    session.lastAttemptAt = Date.now();
-    try {
-      session.recording = await recordCall(signal);
-      if (!session.recording) {
-        await writeLog(
-          `第 ${session.attempts}/${MAX_ATTEMPTS_PER_CALL} 次尝试未成功`,
-        );
-      }
-    } catch (error) {
-      if ((error as Error).name !== "AbortError") {
-        await writeLog(`触发录音失败: ${error}`);
-      }
-    } finally {
-      session.busy = false;
+  if (!(await isCallScreen())) {
+    if (session.recording || session.quiet !== null) {
+      await writeLog("通话已结束，回到挂起等待");
     }
+    session.recording = false;
+    session.quiet = null;
+    session.attempts = 0;
+    return false;
   }
 
-  await watchCallUntilEnd(signal);
+  // 上一通电话点过录音：只有确认"停止录音"已经不在，才算新的一通
+  if (session.recording) {
+    if (await isAlreadyRecording()) {
+      return true;
+    }
+    await writeLog("检测到新的一通电话，重置录音状态");
+    session.recording = false;
+    session.quiet = null;
+    session.attempts = 0;
+  }
+
+  // 本通已经放弃过：每次被唤醒（事件或 2 分钟看门狗）给一次重试机会
+  if (session.quiet === "exhausted") {
+    session.quiet = null;
+    session.attempts = 0;
+  }
+
+  if (session.busy) return true;
+
+  if (session.attempts >= MAX_ATTEMPTS_PER_CALL) {
+    session.quiet = "exhausted";
+    return true;
+  }
+
+  const recentAttempt =
+    Date.now() - session.lastAttemptAt < ATTEMPT_COOLDOWN_MS;
+  if (recentAttempt) {
+    const waitMs = ATTEMPT_COOLDOWN_MS - (Date.now() - session.lastAttemptAt);
+    await sleep(waitMs, { signal });
+    return true;
+  }
+
+  session.busy = true;
+  session.attempts++;
+  session.lastAttemptAt = Date.now();
+  try {
+    const ok = await recordCall(signal);
+    if (ok) {
+      session.recording = true;
+      session.quiet = "recording";
+      await writeLog("录音已触发，直接挂起（不再监测通话是否结束）");
+    } else {
+      await writeLog(`第 ${session.attempts}/${MAX_ATTEMPTS_PER_CALL} 次尝试未成功`);
+      if (session.attempts >= MAX_ATTEMPTS_PER_CALL) {
+        session.quiet = "exhausted";
+        await writeLog("本通电话暂不重试，挂起等待唤醒");
+      }
+    }
+  } catch (error) {
+    if ((error as Error).name !== "AbortError") {
+      await writeLog(`触发录音失败: ${error}`);
+    }
+  } finally {
+    session.busy = false;
+  }
+
   return true;
 }
 
 // ===== 唯一的执行循环：挂起等待 → 命中 → 处理 → 再挂起 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（空闲时零轮询）");
+  await writeLog("通话监听已启动（1.0.3：点完录音立即挂起）");
   while (!signal.aborted) {
+    if (session.quiet !== null) {
+      await waitForWake(signal);
+      if (signal.aborted) return;
+    }
     await waitForCallAnchor(signal);
     if (signal.aborted) return;
     try {
       const handled = await handleCallIfAny(signal);
-      if (!handled) await sleep(FALSE_HIT_BACKOFF_MS);
+      if (!handled) await sleep(FALSE_HIT_BACKOFF_MS, { signal });
     } catch (error) {
       if (signal.aborted || (error as Error).name === "AbortError") return;
       await writeLog(`处理出错: ${error}`);
-      await sleep(FALSE_HIT_BACKOFF_MS);
+      await sleep(FALSE_HIT_BACKOFF_MS, { signal });
     }
   }
 }
@@ -356,6 +430,7 @@ async function watchByApplicationEvents(signal: AbortSignal) {
     if (signal.aborted) return;
     if (!phoneBundleIds.has(event.bundleId)) continue;
     restartIdleWait();
+    signalPhoneActivity();
   }
 }
 
@@ -379,7 +454,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.2) ==========");
+    await writeLog("========== 服务已启动 (1.0.3) ==========");
 
     const supervise = async (name: string, task: () => Promise<void>) => {
       while (!signal.aborted) {
@@ -391,7 +466,7 @@ export default defineExtension({
           if (signal.aborted || (error as Error).name === "AbortError") return;
           await writeLog(`${name}出错: ${error}`);
         }
-        await sleep(5000);
+        await sleep(5000, { signal }).catch(() => undefined);
       }
     };
 

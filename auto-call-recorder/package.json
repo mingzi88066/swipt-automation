@@ -1,6 +1,6 @@
 {
   "name": "auto-call-recorder",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "type": "module",
   "swiplet": {
@@ -8,7 +8,8 @@
     "name": "Auto Call Recorder",
     "minimumAPILevel": 3,
     "localizedNames": {
-      "zh-Hans": "自动通话录音"
+      "zh-Hans": "自动通话录音",
+      "zh-Hant": "自動通話錄音"
     },
     "icon": {
       "color": "#1C1C1E",

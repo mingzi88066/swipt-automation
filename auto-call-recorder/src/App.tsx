@@ -20,7 +20,8 @@ export default function App() {
               <Text>{service.error}</Text>
             ) : (
               <Text>
-                服务运行时，接打电话会自动点击「更多」→「通话录音」。
+                服务运行时，接打电话会自动点击「更多」→「通话录音」
+                （简体/繁体均识别），点完立即挂起。
               </Text>
             )
           }
