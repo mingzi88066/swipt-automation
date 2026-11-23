@@ -45,7 +45,7 @@ const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
 const RECORD_TAP_RETRIES = 3; // 点「通话录音」没生效时的重试次数
 const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 
-// ===== 探测策略（1.0.10）=====
+// ===== 探测策略（1.0.11）=====
 // 排查过程（前几版都栽在同一件事上：把「读屏」当成了主要触发手段）：
 // - 1.0.2~1.0.4 用 accessibility.find(不带 poll) 当等待：屏幕一有元素增删就重读整棵树，
 //   滚动/动画/打字时约 80 次/分钟。
@@ -569,12 +569,14 @@ function shouldProbe(): boolean {
 // 点完录音后自动采 20 秒进程 CPU，把当时的排名写进日志：
 //   - axauditd / SpringBoard / Swipt 靠前 → 是我们的会话
 //   - speechrecognitiond / assistantd / mediaserverd 靠前 → 是系统录音管线
-// 每个服务周期只采一次，避免变成新的负担。
-let cpuSampled = false;
+// 1.0.11 起采两个窗口：点完录音后的 20 秒（通话中），以及挂断后的 20 秒
+// （系统的录音收尾/转写/摘要都落在这段，桌面滑动卡顿也在这段）。每个服务
+// 周期最多采两次，避免变成新的负担。
+let cpuBudget = 2;
 
-async function sampleRecordingCpu(seconds: number): Promise<void> {
-  if (cpuSampled) return;
-  cpuSampled = true;
+async function sampleRecordingCpu(seconds: number, label = "录音中"): Promise<void> {
+  if (cpuBudget <= 0) return;
+  cpuBudget--;
   const probesBefore = stats.probes;
   const table = new Map<
     number,
@@ -622,7 +624,7 @@ async function sampleRecordingCpu(seconds: number): Promise<void> {
       `${row.name} avg=${(row.sum / Math.max(1, row.n)).toFixed(2)} peak=${row.peak.toFixed(2)}`,
   );
   await writeLog(
-    `[cpu 录音中 ${seconds}s] 采样=${samples}份 核心负载=${cores || "?"} 本窗口探测=${stats.probes - probesBefore}次\n  ${lines.join("\n  ") || "(没有拿到数据)"}`,
+    `[cpu ${label} ${seconds}s] 前台=${foreground ?? "?"} 采样=${samples}份 核心负载=${cores || "?"} 本窗口探测=${stats.probes - probesBefore}次\n  ${lines.join("\n  ") || "(没有拿到数据)"}`,
   );
 }
 
@@ -659,7 +661,7 @@ async function handleCall(signal: AbortSignal, recording: boolean) {
       await writeLog("录音已触发，直接挂起（不再监测通话是否结束）");
       // 后台采 20 秒 CPU：卡顿到底是我们的会话还是系统的录音/转写管线，
       // 这一份数据能直接定分。不 await，不影响主循环。
-      void sampleRecordingCpu(20);
+      void sampleRecordingCpu(20, "录音中");
     } else {
       await writeLog(
         `第 ${session.attempts}/${MAX_ATTEMPTS_PER_CALL} 次尝试未成功`,
@@ -680,7 +682,7 @@ async function handleCall(signal: AbortSignal, recording: boolean) {
 
 // ===== 唯一的执行循环：没有定时读屏，只有事件和超长兜底 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（1.0.10：事件唤醒，录音中降频 + CPU 采样）");
+  await writeLog("通话监听已启动（1.0.11：事件唤醒，录音中降频 + 双窗口 CPU 采样）");
   while (!signal.aborted) {
     try {
       const timeout = session.quiet !== null ? L1_QUIET_MS : IDLE_WAIT_MS;
@@ -723,9 +725,13 @@ async function watchCalls(signal: AbortSignal) {
 
       if (probe.kind === "none") {
         if (session.quiet !== null) {
+          const wasRecording = session.quiet === "recording";
           await writeLog("通话已结束，回到空闲等待");
           session.quiet = null;
           session.attempts = 0;
+          // 挂断这一刻正是系统收尾（存文件 / 转写 / 生成摘要）的起点，
+          // 也是「回桌面后整机掉帧」出现的时刻，在这里补采一次 CPU。
+          if (wasRecording) void sampleRecordingCpu(20, "挂断后");
         }
         continue;
       }
@@ -794,7 +800,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.10) ==========");
+    await writeLog("========== 服务已启动 (1.0.11) ==========");
 
     await probeCapabilities();
 
