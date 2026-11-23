@@ -19,16 +19,6 @@ const isCallEndLabel: LabelTest = (label) => /(结束|挂断|結束|掛斷)/.tes
 const isMuteLabel: LabelTest = (label) => /(静音|靜音)/.test(label);
 const isCallAppLabel: LabelTest = (label) => /^(电话|電話|Phone)$/.test(label);
 
-// 空闲挂起的锚点交给 accessibility.find，只支持精确匹配，所以简繁两种都列上
-const CALL_ANCHOR_SELECTORS = [
-  { label: "结束" },
-  { label: "結束" },
-  { label: "挂断" },
-  { label: "掛斷" },
-  { label: "结束通话" },
-  { label: "結束通話" },
-];
-
 // 电话相关 bundleId（iOS 的通话界面归属在 SpringBoard 下）
 const phoneBundleIds = new Set([
   "com.apple.springboard",
@@ -49,8 +39,16 @@ const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
 const RECORD_TAP_RETRIES = 3; // 点「通话录音」没生效时的重试次数
 const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 
-// ===== 性能参数（1.0.4：点完录音立即挂起，不再监测通话结束）=====
-const QUIET_WATCHDOG_MS = 120_000; // 挂起时的兜底唤醒（仅 1 次读屏 / 2 分钟）
+// ===== 性能参数（1.0.5：彻底取消"跟屏幕推送读整棵树"）=====
+// 1.0.4 及以前用 accessibility.find(..., timeoutMs: Infinity) 当空闲等待，
+// 它的语义是「每来一次屏幕变化推送就重新读一遍整棵无障碍树」——
+// 只要屏幕在动（滚动、动画、打字），就变成每秒一次跨进程全树拷贝，
+// 直接卡住 SpringBoard，这就是"用完之后掉帧"的根因。
+// 现在空闲期完全不读屏：只等 App 事件（零成本），外加低频看门狗单次读屏兜底。
+const IDLE_WATCHDOG_MS = 20_000; // 空闲时兜底检查间隔（1 次读屏 / 20 秒）
+const QUIET_WATCHDOG_MS = 60_000; // 挂起后更懒（1 次读屏 / 1 分钟）
+const EVENT_PROBE_TRIES = 8; // 事件唤醒后最多探几次通话界面
+const PROBE_INTERVAL_MS = 600; // 每次探测的间隔
 const FALSE_HIT_BACKOFF_MS = 1500; // 误判后重新挂起等待的间隔
 const LOG_MAX_CHARS = 32 * 1024;
 const LOG_FLUSH_MS = 2000;
@@ -61,14 +59,12 @@ const LOG_FLUSH_MS = 2000;
 //  - "exhausted"：本通重试次数用尽，唤醒后允许再试一次
 type QuietReason = "recording" | "exhausted";
 interface CallSession {
-  recording: boolean; // 本通电话已点过录音
-  quiet: QuietReason | null; // 挂起中
+  quiet: QuietReason | null; // 非 null 表示本通已处理完，挂起中
   attempts: number;
   lastAttemptAt: number;
   busy: boolean;
 }
 const session: CallSession = {
-  recording: false,
   quiet: null,
   attempts: 0,
   lastAttemptAt: 0,
@@ -349,38 +345,8 @@ async function recordCall(signal: AbortSignal): Promise<boolean> {
   return false;
 }
 
-// ===== 空闲/挂起等待：不轮询，靠系统"屏幕推送"与前台事件唤醒 =====
-// accessibility.find 不带 poll 时，一次读取后挂起等待下一次屏幕变化推送，
-// 静止的桌面上几乎不产生任何读取，这是"只在通话界面时运行"的关键。
-let waitController: AbortController | null = null;
-
-function restartIdleWait() {
-  const controller = waitController;
-  waitController = null;
-  controller?.abort();
-}
-
-async function waitForCallAnchor(signal: AbortSignal): Promise<void> {
-  const controller = new AbortController();
-  const forward = () => controller.abort();
-  signal.addEventListener("abort", forward, { once: true });
-  waitController = controller;
-  try {
-    await accessibility.find(CALL_ANCHOR_SELECTORS, {
-      timeoutMs: Number.POSITIVE_INFINITY,
-      signal: controller.signal,
-    });
-  } catch {
-    // 被中断（前台事件唤醒 / 服务停止）属正常路径
-  } finally {
-    if (waitController === controller) waitController = null;
-    signal.removeEventListener("abort", forward);
-  }
-}
-
-// ===== 点完录音后的"挂起" =====
-// 不读屏、不轮询：只等电话类 App 的前台事件（下一通电话一定会触发），
-// 外加一个很长的看门狗兜底，防止事件丢失后永久卡住。
+// ===== 空闲/挂起等待：零读屏，只等 App 事件 =====
+// 事件流由 watchByApplicationEvents 推进，这里只挂一个可能被事件提前唤醒的定时器。
 let wakeUp: (() => void) | null = null;
 
 function signalPhoneActivity() {
@@ -389,45 +355,60 @@ function signalPhoneActivity() {
   resolve?.();
 }
 
-async function waitForWake(signal: AbortSignal): Promise<void> {
-  const wake = new Promise<void>((resolve) => {
-    wakeUp = resolve;
+type WakeReason = "event" | "watchdog";
+
+async function waitForActivity(
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<WakeReason> {
+  const wake = new Promise<WakeReason>((resolve) => {
+    wakeUp = () => resolve("event");
   });
-  const watchdog = sleep(QUIET_WATCHDOG_MS, { signal }).catch(() => undefined);
+  const watchdog: Promise<WakeReason> = sleep(timeoutMs, { signal }).then(
+    () => "watchdog" as WakeReason,
+    () => "watchdog" as WakeReason,
+  );
   try {
-    await Promise.race([wake, watchdog]);
+    return await Promise.race([wake, watchdog]);
   } finally {
-    if (wakeUp !== null) wakeUp = null;
+    wakeUp = null;
   }
 }
 
-// 命中锚点后走一次判定 + 触发流程；返回 true 表示确实处理了一通电话
-async function handleCallIfAny(signal: AbortSignal): Promise<boolean> {
-  if (!(await isCallScreen())) {
-    if (session.recording || session.quiet !== null) {
+// 被唤醒后最多探 tries 次，等通话界面动画到位；tries = 1 就是单次读屏
+async function probeCallScreen(
+  tries: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    if (await isCallScreen()) return true;
+    if (i + 1 >= tries) break;
+    await sleep(PROBE_INTERVAL_MS, { signal });
+  }
+  return false;
+}
+
+// 被唤醒后走一次判定 + 触发流程；返回 true 表示当前确实在处理一通电话
+async function handleCallIfAny(
+  signal: AbortSignal,
+  probeTries: number,
+): Promise<boolean> {
+  // 已挂起（本通处理过）时只需要判断"通话界面还在吗"，探一次就够
+  const tries = session.quiet !== null ? 1 : probeTries;
+  if (!(await probeCallScreen(tries, signal))) {
+    if (session.quiet !== null) {
       await writeLog("通话已结束，回到挂起等待");
     }
-    session.recording = false;
     session.quiet = null;
     session.attempts = 0;
     return false;
   }
 
-  // 上一通电话点过录音：只有确认"停止录音"已经不在，才算新的一通
-  if (session.recording) {
-    if (await isAlreadyRecording()) {
-      return true;
-    }
-    await writeLog("检测到新的一通电话，重置录音状态");
-    session.recording = false;
-    session.quiet = null;
-    session.attempts = 0;
-  }
-
-  // 本通已经放弃过：每次被唤醒（事件或 2 分钟看门狗）给一次重试机会
-  if (session.quiet === "exhausted") {
-    session.quiet = null;
-    session.attempts = 0;
+  // 本通已经点过录音（或已放弃）：绝不再点，安安静静等它结束。
+  // 判断"新的一通"只依据"通话界面消失"，不依据"停止录音"文案——
+  // 录音中的通话主界面并不会一直显示「停止通话录音」，靠它判断会误判成新电话。
+  if (session.quiet !== null) {
+    return true;
   }
 
   if (session.busy) return true;
@@ -451,7 +432,6 @@ async function handleCallIfAny(signal: AbortSignal): Promise<boolean> {
   try {
     const ok = await recordCall(signal);
     if (ok) {
-      session.recording = true;
       session.quiet = "recording";
       await writeLog("录音已触发，直接挂起（不再监测通话是否结束）");
     } else {
@@ -474,18 +454,19 @@ async function handleCallIfAny(signal: AbortSignal): Promise<boolean> {
   return true;
 }
 
-// ===== 唯一的执行循环：挂起等待 → 命中 → 处理 → 再挂起 =====
+// ===== 唯一的执行循环：零读屏等待 → 被唤醒 → 判定 → 再等待 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（1.0.4：简繁识别 + 点完即挂起）");
+  await writeLog("通话监听已启动（1.0.5：空闲零读屏，仅事件唤醒）");
   while (!signal.aborted) {
-    if (session.quiet !== null) {
-      await waitForWake(signal);
-      if (signal.aborted) return;
-    }
-    await waitForCallAnchor(signal);
+    const timeout =
+      session.quiet !== null ? QUIET_WATCHDOG_MS : IDLE_WATCHDOG_MS;
+    const reason = await waitForActivity(signal, timeout);
     if (signal.aborted) return;
     try {
-      const handled = await handleCallIfAny(signal);
+      const handled = await handleCallIfAny(
+        signal,
+        reason === "event" ? EVENT_PROBE_TRIES : 1,
+      );
       if (!handled) await sleep(FALSE_HIT_BACKOFF_MS, { signal });
     } catch (error) {
       if (signal.aborted || (error as Error).name === "AbortError") return;
@@ -502,7 +483,6 @@ async function watchByApplicationEvents(signal: AbortSignal) {
   for await (const event of device.applicationEvents({ signal })) {
     if (signal.aborted) return;
     if (!phoneBundleIds.has(event.bundleId)) continue;
-    restartIdleWait();
     signalPhoneActivity();
   }
 }
@@ -527,7 +507,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.4) ==========");
+    await writeLog("========== 服务已启动 (1.0.5) ==========");
 
     const supervise = async (name: string, task: () => Promise<void>) => {
       while (!signal.aborted) {
