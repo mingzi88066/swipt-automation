@@ -45,7 +45,7 @@ const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
 const RECORD_TAP_RETRIES = 3; // 点「通话录音」没生效时的重试次数
 const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 
-// ===== 探测策略（1.0.8）=====
+// ===== 探测策略（1.0.9）=====
 // 排查过程（前几版都栽在同一件事上：把「读屏」当成了主要触发手段）：
 // - 1.0.2~1.0.4 用 accessibility.find(不带 poll) 当等待：屏幕一有元素增删就重读整棵树，
 //   滚动/动画/打字时约 80 次/分钟。
@@ -57,12 +57,18 @@ const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 // - 纯事件唤醒（前台 App / App 事件 / 屏幕亮起），事件到了才可能读一次
 // - 探测只读 frontApp（通话界面就是前台应用），不再读整个屏幕
 // - 兜底看门狗 90 秒一次，且只在电话类 App / 主屏在前台时
+// 1.0.9：现场反馈「点完一次录音之后才开始卡」，把「点完之后」这一段再压一轮：
+// - 已点过录音（quiet=recording）时，事件唤醒只探 1 次（原来是 3 次连探）
+// - 该状态下的探测节流 1.5s → 3s，兜底 20s → 60s
+// - 每次探测都在内存里记一笔（时间/耗时/结果/触发原因），readLog 直接带出来，
+//   用来判断「到底是我们读屏读的，还是系统录音管线自己的开销」
 const L1_DEPTH = 26; // 探测深度：通话按钮在 8~14 层，26 足够且少拷贝一半节点
 const IDLE_WAIT_MS = 90_000; // 空闲兜底（无任何事件的极端情况）
-const L1_QUIET_MS = 20_000; // 已点过录音：只为发现"通话界面消失"
+const L1_QUIET_MS = 60_000; // 已点过录音：只为发现"通话界面消失"
 const EVENT_PROBE_TRIES = 3; // 事件唤醒后最多探几次（等界面动画到位）
 const PROBE_INTERVAL_MS = 500; // 每次探测的间隔
 const EVENT_THROTTLE_MS = 1500; // 两次探测之间的最小间隔
+const QUIET_THROTTLE_MS = 3000; // 已点过录音后：两次探测之间的最小间隔
 const FALSE_HIT_BACKOFF_MS = 1200;
 
 const LOG_MAX_CHARS = 32 * 1024;
@@ -95,6 +101,43 @@ const stats = {
   taps: 0,
   skipped: 0,
 };
+
+// 最近若干次探测的时间线：用来核对「卡顿期间到底读了几次、每次多贵」。
+// 只放内存（最多 60 条），不写文件，避免日志自己在卡顿里添乱。
+type ProbeWhy = "event" | "timer" | "manual" | "confirm";
+interface ProbeRecord {
+  t: number; // 时间戳（ms）
+  ms: number; // 本次耗时
+  why: ProbeWhy; // 触发原因
+  r: "none" | "call" | "recording" | "err";
+}
+const probeTimeline: ProbeRecord[] = [];
+const PROBE_TIMELINE_MAX = 60;
+
+function recordProbe(record: ProbeRecord) {
+  probeTimeline.push(record);
+  if (probeTimeline.length > PROBE_TIMELINE_MAX) probeTimeline.shift();
+}
+
+// 「最近一分钟读了几次、每次多久」——判断卡顿是不是读屏读出来的关键数据
+function probeSummary() {
+  const now = Date.now();
+  const recent = probeTimeline.filter((r) => now - r.t <= 60_000);
+  return {
+    lastMinute: recent.length,
+    avgMs:
+      recent.length > 0
+        ? Math.round(recent.reduce((sum, r) => sum + r.ms, 0) / recent.length)
+        : 0,
+    maxMs: recent.reduce((max, r) => Math.max(max, r.ms), 0),
+    timeline: probeTimeline.map((r) => ({
+      at: new Date(r.t).toISOString().slice(11, 23),
+      ms: r.ms,
+      why: r.why,
+      r: r.r,
+    })),
+  };
+}
 
 // 设备端 Swipt 版本可能不支持某些参数/状态，启动时探测一次，不支持就退回全树读取。
 let depthSupported = true;
@@ -318,29 +361,40 @@ type ProbeResult =
   | { kind: "recording" };
 
 // 浅层探测：单次快照 + 极小的递归判断
-async function probeLite(signal?: AbortSignal): Promise<ProbeResult> {
+async function probeLite(
+  signal?: AbortSignal,
+  why: ProbeWhy = "event",
+): Promise<ProbeResult> {
   const started = Date.now();
   try {
     const snapshot = await readLite(signal);
     const root = snapshot.root;
+    const ms = Date.now() - started;
+    stats.probes++;
+    stats.lastProbeMs = ms;
+    stats.probeMs += ms;
     // 快照自带前台 bundleId，顺手校准一次：前台已经不在白名单就白读了
     if (foregroundSupported && !callFrontApps.has(snapshot.app)) {
       foreground = snapshot.app;
-      stats.probes++;
-      stats.lastProbeMs = Date.now() - started;
-      stats.probeMs += stats.lastProbeMs;
+      recordProbe({ t: started, ms, why, r: "none" });
       return { kind: "none" };
     }
-    stats.probes++;
-    stats.lastProbeMs = Date.now() - started;
-    stats.probeMs += stats.lastProbeMs;
-    if (hasLabel(root, isStopRecordLabel)) return { kind: "recording" };
-    if (looksLikeCall(root)) return { kind: "call" };
+    if (hasLabel(root, isStopRecordLabel)) {
+      recordProbe({ t: started, ms, why, r: "recording" });
+      return { kind: "recording" };
+    }
+    if (looksLikeCall(root)) {
+      recordProbe({ t: started, ms, why, r: "call" });
+      return { kind: "call" };
+    }
+    recordProbe({ t: started, ms, why, r: "none" });
     return { kind: "none" };
   } catch (error) {
     if ((error as Error).name === "AbortError") throw error;
+    const ms = Date.now() - started;
     stats.probes++;
-    stats.lastProbeMs = Date.now() - started;
+    stats.lastProbeMs = ms;
+    recordProbe({ t: started, ms, why, r: "err" });
     return { kind: "none" };
   }
 }
@@ -559,7 +613,7 @@ async function handleCall(signal: AbortSignal, recording: boolean) {
 
 // ===== 唯一的执行循环：没有定时读屏，只有事件和超长兜底 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（1.0.8：事件唤醒，不做定时读屏）");
+  await writeLog("通话监听已启动（1.0.9：事件唤醒，录音中降频）");
   while (!signal.aborted) {
     try {
       const timeout = session.quiet !== null ? L1_QUIET_MS : IDLE_WAIT_MS;
@@ -577,21 +631,25 @@ async function watchCalls(signal: AbortSignal) {
         continue;
       }
 
-      // 事件可能连发（切 App、亮屏），探测本身有成本，压到 1.5 秒一次
+      // 事件可能连发（切 App、亮屏），探测本身有成本，压到 1.5 秒一次；
+      // 已经点过录音后放宽到 3 秒——这一段是「录音中」，界面在持续刷新，
+      // 事件更密，没必要跟着它一起读。
       if (reason === "event") {
+        const throttle =
+          session.quiet === null ? EVENT_THROTTLE_MS : QUIET_THROTTLE_MS;
         const gap = Date.now() - lastProbeAt;
-        if (gap < EVENT_THROTTLE_MS) {
-          await sleep(EVENT_THROTTLE_MS - gap, { signal });
+        if (gap < throttle) {
+          await sleep(throttle - gap, { signal });
         }
       }
 
-      // 事件唤醒：连探几次等界面动画到位；看门狗唤醒：只探一次
+      // 事件唤醒：连探几次等界面动画到位；看门狗唤醒、或已经点过录音：只探一次
       const tries =
         reason === "event" && session.quiet === null ? EVENT_PROBE_TRIES : 1;
       let probe: ProbeResult = { kind: "none" };
       for (let i = 0; i < tries; i++) {
         lastProbeAt = Date.now();
-        probe = await probeLite(signal);
+        probe = await probeLite(signal, reason === "event" ? "event" : "timer");
         if (probe.kind !== "none") break;
         if (i + 1 < tries) await sleep(PROBE_INTERVAL_MS, { signal });
       }
@@ -669,7 +727,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.8) ==========");
+    await writeLog("========== 服务已启动 (1.0.9) ==========");
 
     await probeCapabilities();
 
@@ -806,6 +864,7 @@ export default defineExtension({
               stats.probes > 0 ? Math.round(stats.probeMs / stats.probes) : 0,
           },
           phoneProcesses: processes,
+          probes: probeSummary(),
         };
       },
     }),
@@ -829,7 +888,7 @@ export default defineExtension({
 
     readLog: defineAction({
       title: "Read Debug Log",
-      description: "读取自动记录的调试日志",
+      description: "读取自动记录的调试日志与最近读屏时间线",
       run: async () => {
         try {
           await flushLog();
@@ -841,6 +900,8 @@ export default defineExtension({
               averageProbeMs:
                 stats.probes > 0 ? Math.round(stats.probeMs / stats.probes) : 0,
             },
+            probes: probeSummary(),
+            session: { quiet: session.quiet, attempts: session.attempts },
           };
         } catch {
           return { log: "(日志文件不存在)" };
