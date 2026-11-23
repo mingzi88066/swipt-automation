@@ -45,20 +45,23 @@ const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
 const RECORD_TAP_RETRIES = 3; // 点「通话录音」没生效时的重试次数
 const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 
-// ===== 探测策略（1.0.6）=====
-// 1.0.2~1.0.4：用 accessibility.find(不带 poll) 当等待，屏幕有元素增删就重读整棵树，
-//             滚动/动画/打字时约 80 次/分钟，SpringBoard 渲染被拖住 → 掉帧。
-// 1.0.5：只等 App 事件，但事件里含 SpringBoard（每次回桌面都触发），且一次事件连读 8 遍全树；
-//        同时通话界面出现时往往没有 App 事件 → 既卡顿又漏点。
-// 1.0.6：周期探测改为「浅层快照」（depth 控制节点数），间隔按场景调整；
-//        事件只作加速（仅电话类 App），前台/屏幕状态用推送订阅，零轮询。
-const L1_DEPTH = 30; // 探测深度：通话界面按钮在 8~14 层，30 足够且省掉深层装饰节点
-const L1_FAST_MS = 3000; // 电话类 App 在前台：3 秒一探
-const L1_HOME_MS = 6000; // 主屏（SpringBoard）在前台：6 秒一探
-const L1_QUIET_MS = 5000; // 已点过录音：只需发现"通话界面消失"，好接下一通
-const IDLE_WAIT_MS = 30_000; // 前台是别的 App：只等推送，30 秒兜底一次
-const HOT_MISS_LIMIT = 4; // 连续这么多次探不到，就认为刚才的电话活动不是通话
-const PHONE_HOT_MS = 30_000; // 电话类活动后这段时间内算"热"
+// ===== 探测策略（1.0.8）=====
+// 排查过程（前几版都栽在同一件事上：把「读屏」当成了主要触发手段）：
+// - 1.0.2~1.0.4 用 accessibility.find(不带 poll) 当等待：屏幕一有元素增删就重读整棵树，
+//   滚动/动画/打字时约 80 次/分钟。
+// - 1.0.5 改成 App 事件驱动，但把 SpringBoard 也当电话活动，回一次桌面连读 8 遍全树。
+// - 1.0.6 / 1.0.7 改成周期性浅层快照：读得少了，但「周期性」本身还在——
+//   主屏 6 秒、通话中 5 秒各读一次 fullScreen。而 fullScreen 要同时读 SpringBoard
+//   和前台 App 的树，单次几百毫秒，期间 axauditd 主队列被占住，UI 直接掉帧。
+// 1.0.8 不再有任何「定时读屏」：
+// - 纯事件唤醒（前台 App / App 事件 / 屏幕亮起），事件到了才可能读一次
+// - 探测只读 frontApp（通话界面就是前台应用），不再读整个屏幕
+// - 兜底看门狗 90 秒一次，且只在电话类 App / 主屏在前台时
+const L1_DEPTH = 26; // 探测深度：通话按钮在 8~14 层，26 足够且少拷贝一半节点
+const IDLE_WAIT_MS = 90_000; // 空闲兜底（无任何事件的极端情况）
+const L1_QUIET_MS = 20_000; // 已点过录音：只为发现"通话界面消失"
+const EVENT_PROBE_TRIES = 3; // 事件唤醒后最多探几次（等界面动画到位）
+const PROBE_INTERVAL_MS = 500; // 每次探测的间隔
 const EVENT_THROTTLE_MS = 1500; // 两次探测之间的最小间隔
 const FALSE_HIT_BACKOFF_MS = 1200;
 
@@ -98,8 +101,6 @@ let depthSupported = true;
 let foregroundSupported = true;
 let displayOn = true;
 let foreground: string | null = null;
-let lastPhoneActivityAt = 0;
-let hotMisses = 0;
 let lastProbeAt = 0;
 
 function abortError(): Error {
@@ -215,13 +216,15 @@ function pickTappable(
   return best;
 }
 
-// 完整读取：只在确认通话后使用（点击阶段）
+// 完整读取：只在确认通话后使用（点击阶段）。
+// 通话界面就是前台应用，读 frontApp 即可；fullScreen 会连 SpringBoard 桌面一起读，
+// 节点数翻倍、耗时翻倍，而按钮就在前台这棵树里。
 async function readScreen(options?: {
   depth?: number;
   signal?: AbortSignal;
 }): Promise<AccessibilitySnapshot> {
   return accessibility.snapshot({
-    scope: "fullScreen",
+    scope: "frontApp",
     full: true,
     ...(options?.depth !== undefined ? { depth: options.depth } : {}),
     ...(options?.signal !== undefined ? { signal: options.signal } : {}),
@@ -234,12 +237,12 @@ async function readScreen(options?: {
 async function readLite(signal?: AbortSignal): Promise<AccessibilitySnapshot> {
   if (!depthSupported) {
     return accessibility.snapshot({
-      scope: "fullScreen",
+      scope: "frontApp",
       ...(signal !== undefined ? { signal } : {}),
     });
   }
   return accessibility.snapshot({
-    scope: "fullScreen",
+    scope: "frontApp",
     depth: L1_DEPTH,
     ...(signal !== undefined ? { signal } : {}),
   });
@@ -248,7 +251,7 @@ async function readLite(signal?: AbortSignal): Promise<AccessibilitySnapshot> {
 // 启动时确认 depth 参数被接受
 async function probeCapabilities(): Promise<void> {
   try {
-    await accessibility.snapshot({ scope: "fullScreen", depth: L1_DEPTH });
+    await accessibility.snapshot({ scope: "frontApp", depth: L1_DEPTH });
   } catch (error) {
     depthSupported = false;
     await writeLog(
@@ -504,14 +507,6 @@ function shouldProbe(): boolean {
   return callFrontApps.has(foreground);
 }
 
-// 当前该用多慢的节奏探测
-function probeInterval(): number {
-  if (!shouldProbe()) return IDLE_WAIT_MS;
-  if (session.quiet !== null) return L1_QUIET_MS;
-  if (Date.now() - lastPhoneActivityAt < PHONE_HOT_MS) return L1_FAST_MS;
-  if (foreground === "com.apple.springboard") return L1_HOME_MS;
-  return L1_FAST_MS;
-}
 
 // ===== 处理一通电话 =====
 async function handleCall(signal: AbortSignal, recording: boolean) {
@@ -562,13 +557,13 @@ async function handleCall(signal: AbortSignal, recording: boolean) {
   }
 }
 
-// ===== 唯一的执行循环 =====
+// ===== 唯一的执行循环：没有定时读屏，只有事件和超长兜底 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（1.0.7：只在电话类 App 前台时读屏）");
+  await writeLog("通话监听已启动（1.0.8：事件唤醒，不做定时读屏）");
   while (!signal.aborted) {
     try {
-      const interval = probeInterval();
-      const reason = await waitForWake(signal, interval);
+      const timeout = session.quiet !== null ? L1_QUIET_MS : IDLE_WAIT_MS;
+      const reason = await waitForWake(signal, timeout);
       if (signal.aborted) return;
 
       // 熄屏不读：夜间/口袋里的读屏纯属浪费
@@ -590,24 +585,26 @@ async function watchCalls(signal: AbortSignal) {
         }
       }
 
-      lastProbeAt = Date.now();
-      const probe = await probeLite(signal);
+      // 事件唤醒：连探几次等界面动画到位；看门狗唤醒：只探一次
+      const tries =
+        reason === "event" && session.quiet === null ? EVENT_PROBE_TRIES : 1;
+      let probe: ProbeResult = { kind: "none" };
+      for (let i = 0; i < tries; i++) {
+        lastProbeAt = Date.now();
+        probe = await probeLite(signal);
+        if (probe.kind !== "none") break;
+        if (i + 1 < tries) await sleep(PROBE_INTERVAL_MS, { signal });
+      }
+
       if (probe.kind === "none") {
-        // 只是打开了电话 App / 从电话 App 退出来：探测几轮没有通话特征就退出"热"状态
-        if (Date.now() - lastPhoneActivityAt < PHONE_HOT_MS) {
-          hotMisses++;
-          if (hotMisses >= HOT_MISS_LIMIT) lastPhoneActivityAt = 0;
-        }
         if (session.quiet !== null) {
-          await writeLog("通话已结束，回到空闲探测");
+          await writeLog("通话已结束，回到空闲等待");
           session.quiet = null;
           session.attempts = 0;
         }
         continue;
       }
 
-      lastPhoneActivityAt = Date.now();
-      hotMisses = 0;
       await handleCall(signal, probe.kind === "recording");
     } catch (error) {
       if (signal.aborted || (error as Error).name === "AbortError") return;
@@ -622,7 +619,6 @@ async function watchApplicationEvents(signal: AbortSignal) {
   for await (const event of device.applicationEvents({ signal })) {
     if (signal.aborted) return;
     if (!phoneBundleIds.has(event.bundleId)) continue;
-    lastPhoneActivityAt = Date.now();
     signalActivity();
   }
 }
@@ -632,10 +628,15 @@ async function watchForeground(signal: AbortSignal) {
     if (signal.aborted) return;
     const changed = app !== foreground;
     foreground = app;
-    if (changed && phoneBundleIds.has(app)) {
-      lastPhoneActivityAt = Date.now();
-    }
     if (changed) signalActivity();
+  }
+}
+
+async function watchLocked(signal: AbortSignal) {
+  for await (const locked of device.locked.values({ signal })) {
+    if (signal.aborted) return;
+    // 从锁屏直接接听：解锁那一刻通话界面已经在了，但可能没有 App 前台事件
+    if (!locked) signalActivity();
   }
 }
 
@@ -668,7 +669,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.7) ==========");
+    await writeLog("========== 服务已启动 (1.0.8) ==========");
 
     await probeCapabilities();
 
@@ -708,6 +709,9 @@ export default defineExtension({
       tasks.push(supervise("屏幕状态监听", () => watchDisplay(signal)));
     } else {
       await writeLog("当前 Swipt 版本不支持屏幕状态订阅，熄屏节流不生效");
+    }
+    if (watchable(device.locked)) {
+      tasks.push(supervise("锁屏状态监听", () => watchLocked(signal)));
     }
     await Promise.all(tasks);
 
@@ -752,7 +756,7 @@ export default defineExtension({
           const started = Date.now();
           try {
             const snapshot = await accessibility.snapshot({
-              scope: "fullScreen",
+              scope: "frontApp",
               depth,
             });
             probe.push({
@@ -769,11 +773,12 @@ export default defineExtension({
             probe.push({ depth, error: String(e) });
           }
         }
+        // 对照：fullScreen 要读 SpringBoard + 前台 + 系统 UI，比 frontApp 贵多少
         const fullStarted = Date.now();
         let fullMs = -1;
         let fullLabels = 0;
         try {
-          const snapshot = await readScreen();
+          const snapshot = await accessibility.snapshot({ scope: "fullScreen" });
           fullMs = Date.now() - fullStarted;
           fullLabels = collectLabels(snapshot.root).length;
         } catch {}
