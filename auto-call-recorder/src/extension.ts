@@ -32,6 +32,9 @@ const phoneBundleIds = new Set([
   "com.apple.TelephonyUtilities",
 ]);
 
+// 只有这几种前台才可能显示通话界面：电话 App / CallKit 服务 / SpringBoard（通话界面由它承载）
+const callFrontApps = new Set<string>([...phoneBundleIds, "com.apple.springboard"]);
+
 // ===== 行为参数 =====
 const STABILIZE_MS = 1000; // 通话界面出现后等待稳定
 const MENU_OPEN_MS = 700; // 点击「更多」后等菜单弹出
@@ -50,10 +53,10 @@ const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 // 1.0.6：周期探测改为「浅层快照」（depth 控制节点数），间隔按场景调整；
 //        事件只作加速（仅电话类 App），前台/屏幕状态用推送订阅，零轮询。
 const L1_DEPTH = 30; // 探测深度：通话界面按钮在 8~14 层，30 足够且省掉深层装饰节点
-const L1_FAST_MS = 2000; // 刚有电话类活动：2 秒一探
-const L1_HOME_MS = 4000; // 停在主屏：4 秒一探
-const L1_AWAY_MS = 6000; // 在用别的 App（来电横幅可能随时覆盖）：6 秒一探
-const L1_QUIET_MS = 3000; // 已点过录音：只需发现"通话界面消失"，好接下一通
+const L1_FAST_MS = 3000; // 电话类 App 在前台：3 秒一探
+const L1_HOME_MS = 6000; // 主屏（SpringBoard）在前台：6 秒一探
+const L1_QUIET_MS = 5000; // 已点过录音：只需发现"通话界面消失"，好接下一通
+const IDLE_WAIT_MS = 30_000; // 前台是别的 App：只等推送，30 秒兜底一次
 const HOT_MISS_LIMIT = 4; // 连续这么多次探不到，就认为刚才的电话活动不是通话
 const PHONE_HOT_MS = 30_000; // 电话类活动后这段时间内算"热"
 const EVENT_THROTTLE_MS = 1500; // 两次探测之间的最小间隔
@@ -87,10 +90,12 @@ const stats = {
   lastProbeMs: 0,
   hits: 0,
   taps: 0,
+  skipped: 0,
 };
 
 // 设备端 Swipt 版本可能不支持某些参数/状态，启动时探测一次，不支持就退回全树读取。
 let depthSupported = true;
+let foregroundSupported = true;
 let displayOn = true;
 let foreground: string | null = null;
 let lastPhoneActivityAt = 0;
@@ -315,6 +320,14 @@ async function probeLite(signal?: AbortSignal): Promise<ProbeResult> {
   try {
     const snapshot = await readLite(signal);
     const root = snapshot.root;
+    // 快照自带前台 bundleId，顺手校准一次：前台已经不在白名单就白读了
+    if (foregroundSupported && !callFrontApps.has(snapshot.app)) {
+      foreground = snapshot.app;
+      stats.probes++;
+      stats.lastProbeMs = Date.now() - started;
+      stats.probeMs += stats.lastProbeMs;
+      return { kind: "none" };
+    }
     stats.probes++;
     stats.lastProbeMs = Date.now() - started;
     stats.probeMs += stats.lastProbeMs;
@@ -483,14 +496,21 @@ function waitForWake(signal: AbortSignal, timeoutMs: number): Promise<WakeReason
   });
 }
 
+// 前台不是通话相关 App 时，一次屏都不读——电话不会凭空出现在微信界面上。
+// 订阅不可用（老版本 Swipt）或前台未知时保守放行。
+function shouldProbe(): boolean {
+  if (!foregroundSupported) return true;
+  if (foreground === null) return true;
+  return callFrontApps.has(foreground);
+}
+
 // 当前该用多慢的节奏探测
 function probeInterval(): number {
+  if (!shouldProbe()) return IDLE_WAIT_MS;
   if (session.quiet !== null) return L1_QUIET_MS;
   if (Date.now() - lastPhoneActivityAt < PHONE_HOT_MS) return L1_FAST_MS;
-  if (foreground === null) return L1_HOME_MS;
-  if (phoneBundleIds.has(foreground)) return L1_FAST_MS;
   if (foreground === "com.apple.springboard") return L1_HOME_MS;
-  return L1_AWAY_MS;
+  return L1_FAST_MS;
 }
 
 // ===== 处理一通电话 =====
@@ -544,7 +564,7 @@ async function handleCall(signal: AbortSignal, recording: boolean) {
 
 // ===== 唯一的执行循环 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（1.0.6：浅层周期探测，事件仅加速）");
+  await writeLog("通话监听已启动（1.0.7：只在电话类 App 前台时读屏）");
   while (!signal.aborted) {
     try {
       const interval = probeInterval();
@@ -552,7 +572,15 @@ async function watchCalls(signal: AbortSignal) {
       if (signal.aborted) return;
 
       // 熄屏不读：夜间/口袋里的读屏纯属浪费
-      if (!displayOn) continue;
+      if (!displayOn) {
+        stats.skipped++;
+        continue;
+      }
+      // 前台不是电话类 App：不可能显示通话界面，跳过这一次读屏
+      if (!shouldProbe()) {
+        stats.skipped++;
+        continue;
+      }
 
       // 事件可能连发（切 App、亮屏），探测本身有成本，压到 1.5 秒一次
       if (reason === "event") {
@@ -640,7 +668,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.6) ==========");
+    await writeLog("========== 服务已启动 (1.0.7) ==========");
 
     await probeCapabilities();
 
@@ -672,6 +700,9 @@ export default defineExtension({
     ];
     if (watchable(device.foregroundApplication)) {
       tasks.push(supervise("前台 App 监听", () => watchForeground(signal)));
+    } else {
+      foregroundSupported = false;
+      await writeLog("当前 Swipt 版本不支持前台 App 订阅，退回全时探测");
     }
     if (watchable(device.displayState)) {
       tasks.push(supervise("屏幕状态监听", () => watchDisplay(signal)));
