@@ -45,7 +45,7 @@ const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
 const RECORD_TAP_RETRIES = 3; // 点「通话录音」没生效时的重试次数
 const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 
-// ===== 探测策略（1.0.9）=====
+// ===== 探测策略（1.0.10）=====
 // 排查过程（前几版都栽在同一件事上：把「读屏」当成了主要触发手段）：
 // - 1.0.2~1.0.4 用 accessibility.find(不带 poll) 当等待：屏幕一有元素增删就重读整棵树，
 //   滚动/动画/打字时约 80 次/分钟。
@@ -562,6 +562,70 @@ function shouldProbe(): boolean {
 }
 
 
+// ===== 录音期间的 CPU 采样（1.0.10，诊断用）=====
+// 现场反馈：服务开着不卡，通话里点完「通话录音」才开始卡，关掉服务立刻不卡。
+// 这既可能是「我们的 AX 会话放大了录音界面的每秒刷新」，也可能是
+// 「iOS 18.1 的录音 + 实时转写」自己吃满了机器。光靠现象分不出来，所以
+// 点完录音后自动采 20 秒进程 CPU，把当时的排名写进日志：
+//   - axauditd / SpringBoard / Swipt 靠前 → 是我们的会话
+//   - speechrecognitiond / assistantd / mediaserverd 靠前 → 是系统录音管线
+// 每个服务周期只采一次，避免变成新的负担。
+let cpuSampled = false;
+
+async function sampleRecordingCpu(seconds: number): Promise<void> {
+  if (cpuSampled) return;
+  cpuSampled = true;
+  const probesBefore = stats.probes;
+  const table = new Map<
+    number,
+    { name: string; sum: number; peak: number; n: number }
+  >();
+  let cores = "";
+  let samples = 0;
+  const deadline = Date.now() + seconds * 1000;
+  const controller = new AbortController();
+  const guard = setTimeout(() => controller.abort(), (seconds + 20) * 1000);
+  try {
+    for await (const sample of proc.resourceUsage({
+      intervalMs: 1000,
+      processAttributes: ["cpuUsage"],
+      signal: controller.signal,
+    })) {
+      samples++;
+      if (sample.cpuLoadPerCore?.length) {
+        cores = sample.cpuLoadPerCore.map((v) => v.toFixed(0)).join("/");
+      }
+      for (const entry of sample.processes) {
+        const cpu = typeof entry.cpuUsage === "number" ? entry.cpuUsage : 0;
+        if (cpu <= 0) continue;
+        const name =
+          entry.bundleId ??
+          (entry.executablePath
+            ? (entry.executablePath.split("/").pop() ?? `pid ${entry.pid}`)
+            : `pid ${entry.pid}`);
+        const row = table.get(entry.pid) ?? { name, sum: 0, peak: 0, n: 0 };
+        row.sum += cpu;
+        row.peak = Math.max(row.peak, cpu);
+        row.n++;
+        table.set(entry.pid, row);
+      }
+      if (Date.now() >= deadline) break;
+    }
+  } catch (error) {
+    await writeLog(`[cpu] 采样中断: ${error}`);
+  } finally {
+    clearTimeout(guard);
+  }
+  const top = [...table.values()].sort((a, b) => b.sum - a.sum).slice(0, 12);
+  const lines = top.map(
+    (row) =>
+      `${row.name} avg=${(row.sum / Math.max(1, row.n)).toFixed(2)} peak=${row.peak.toFixed(2)}`,
+  );
+  await writeLog(
+    `[cpu 录音中 ${seconds}s] 采样=${samples}份 核心负载=${cores || "?"} 本窗口探测=${stats.probes - probesBefore}次\n  ${lines.join("\n  ") || "(没有拿到数据)"}`,
+  );
+}
+
 // ===== 处理一通电话 =====
 async function handleCall(signal: AbortSignal, recording: boolean) {
   if (recording) {
@@ -593,6 +657,9 @@ async function handleCall(signal: AbortSignal, recording: boolean) {
     if (ok) {
       session.quiet = "recording";
       await writeLog("录音已触发，直接挂起（不再监测通话是否结束）");
+      // 后台采 20 秒 CPU：卡顿到底是我们的会话还是系统的录音/转写管线，
+      // 这一份数据能直接定分。不 await，不影响主循环。
+      void sampleRecordingCpu(20);
     } else {
       await writeLog(
         `第 ${session.attempts}/${MAX_ATTEMPTS_PER_CALL} 次尝试未成功`,
@@ -613,7 +680,7 @@ async function handleCall(signal: AbortSignal, recording: boolean) {
 
 // ===== 唯一的执行循环：没有定时读屏，只有事件和超长兜底 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（1.0.9：事件唤醒，录音中降频）");
+  await writeLog("通话监听已启动（1.0.10：事件唤醒，录音中降频 + CPU 采样）");
   while (!signal.aborted) {
     try {
       const timeout = session.quiet !== null ? L1_QUIET_MS : IDLE_WAIT_MS;
@@ -727,7 +794,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.9) ==========");
+    await writeLog("========== 服务已启动 (1.0.10) ==========");
 
     await probeCapabilities();
 

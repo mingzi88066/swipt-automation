@@ -7,7 +7,7 @@
         "zh-Hans": "自动通话录音",
         "zh-Hant": "自動通話錄音"
       },
-      "version": "1.0.9",
+      "version": "1.0.10",
       "icon": {
         "color": "#1C1C1E",
         "symbol": "mic.circle.fill",
@@ -49,8 +49,8 @@
         }
       ],
       "url": "auto-call-recorder.swiplet",
-      "size": 18227,
-      "sha256": "be03bb77c4e5390f359a379768164b57af9f4bbc718057545570f8f3b0af1526"
+      "size": 19803,
+      "sha256": "ab59992fe20bf6f1b41e534e3931cf07452983b58e6ead56ceeb2700ed53025a"
     }
   ],
   "name": "mingzi Swiplets",
