@@ -43,9 +43,8 @@ const FIND_POLL_MS = 600; // 找按钮时的重读间隔
 const ATTEMPT_COOLDOWN_MS = 8000; // 一次失败后的冷却
 const MAX_ATTEMPTS_PER_CALL = 3; // 每通电话最多尝试次数
 const RECORD_TAP_RETRIES = 3; // 点「通话录音」没生效时的重试次数
-const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 
-// ===== 探测策略（1.0.11）=====
+// ===== 探测策略（1.0.12）=====
 // 排查过程（前几版都栽在同一件事上：把「读屏」当成了主要触发手段）：
 // - 1.0.2~1.0.4 用 accessibility.find(不带 poll) 当等待：屏幕一有元素增删就重读整棵树，
 //   滚动/动画/打字时约 80 次/分钟。
@@ -57,6 +56,13 @@ const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 // - 纯事件唤醒（前台 App / App 事件 / 屏幕亮起），事件到了才可能读一次
 // - 探测只读 frontApp（通话界面就是前台应用），不再读整个屏幕
 // - 兜底看门狗 90 秒一次，且只在电话类 App / 主屏在前台时
+// 1.0.12：现场反馈「点完录音后整机一卡一卡，直到关掉服务才恢复」。App 源码
+// 里写着一条已知故障链：远端 AX 连接异常结束时，axauditd 会继续「为没有客户端
+// 的请求」在每次屏幕变化时生成前台树，直到被杀死为止。录音界面恰好每秒都在变，
+// 而我们在点完之后还要回读几次界面（确认菜单收起 / 3 秒节流探测 / 60 秒兜底），
+// 每一次都可能把 axauditd 推进 silent/stalled 判定 → 重启 → 卡顿持续。
+// 因此 1.0.12 把「点完之后」彻底断开：不回读确认、事件唤醒一律不读，
+// 只留 3 分钟一次的兜底，复位改由「前台离开通话类 App」这种不需要读屏的信号完成。
 // 1.0.9：现场反馈「点完一次录音之后才开始卡」，把「点完之后」这一段再压一轮：
 // - 已点过录音（quiet=recording）时，事件唤醒只探 1 次（原来是 3 次连探）
 // - 该状态下的探测节流 1.5s → 3s，兜底 20s → 60s
@@ -64,11 +70,11 @@ const RECORD_CONFIRM_MS = 700; // 点完只看一眼菜单是否收起
 //   用来判断「到底是我们读屏读的，还是系统录音管线自己的开销」
 const L1_DEPTH = 26; // 探测深度：通话按钮在 8~14 层，26 足够且少拷贝一半节点
 const IDLE_WAIT_MS = 90_000; // 空闲兜底（无任何事件的极端情况）
-const L1_QUIET_MS = 60_000; // 已点过录音：只为发现"通话界面消失"
+const L1_QUIET_MS = 180_000; // 已点过录音：3 分钟读一次，只为发现"通话界面消失"
 const EVENT_PROBE_TRIES = 3; // 事件唤醒后最多探几次（等界面动画到位）
 const PROBE_INTERVAL_MS = 500; // 每次探测的间隔
 const EVENT_THROTTLE_MS = 1500; // 两次探测之间的最小间隔
-const QUIET_THROTTLE_MS = 3000; // 已点过录音后：两次探测之间的最小间隔
+const QUIET_THROTTLE_MS = 3000; // 仅用于非静默路径的兜底节流
 const FALSE_HIT_BACKOFF_MS = 1200;
 
 const LOG_MAX_CHARS = 32 * 1024;
@@ -407,20 +413,6 @@ async function isAlreadyRecording(signal?: AbortSignal): Promise<boolean> {
   }
 }
 
-// 录音 UI 的三种状态：正在录音 / 「更多」菜单还开着 / 两者都没有
-type RecordUiState = "recording" | "menu" | "plain";
-
-async function readRecordUiState(signal?: AbortSignal): Promise<RecordUiState> {
-  try {
-    const root = (await readScreen({ signal })).root;
-    if (hasLabel(root, isStopRecordLabel)) return "recording";
-    if (hasLabel(root, isRecordLabel)) return "menu";
-    return "plain";
-  } catch {
-    return "plain";
-  }
-}
-
 // 找可点元素：只在点击那一刻轮询快照，几秒内结束
 async function waitForLabeled(
   test: LabelTest,
@@ -487,21 +479,20 @@ async function recordCall(
   await sleep(MENU_OPEN_MS, { signal });
   if (signal.aborted) return false;
 
-  // 点「通话录音 / 通話錄音」：只看一眼这次点击有没有落到按钮上（菜单是否收起），
-  // 不确认录音是否真的在跑，更不会去等通话结束。
+  // 点「通话录音 / 通話錄音」。
+  // 1.0.12 起点完不再回读确认界面：那几次读屏正好落在录音刚启动、通话界面
+  // 最忙的时刻，最容易把 axauditd 推到「前台应用不应答」的判定（silent /
+  // stalled）里，而 App 侧遇到这种情况会杀掉并重启 axauditd；一旦重启失败，
+  // axauditd 会继续在没有客户端的情况下为每次屏幕变化生成前台树——整机一直
+  // 掉帧，直到连接被拆掉为止（也就是「关了服务才不卡」）。
+  // 少读这几次，换的是「点了但没生效」时不会自动重试：点击本身失败（timeout）
+  // 仍然会重试，文案匹配错误造成的空点则留给下一通。
   for (let attempt = 0; attempt < RECORD_TAP_RETRIES; attempt++) {
     if (!(await tapByLabel(isRecordLabel, "通话录音/通話錄音", signal))) {
       break;
     }
-    await sleep(RECORD_CONFIRM_MS, { signal });
-    const state = await readRecordUiState(signal);
-    if (state !== "menu") {
-      await writeLog(
-        state === "recording" ? "录音已开启 ✅" : "菜单已收起，视为已触发录音",
-      );
-      return true;
-    }
-    await writeLog(`第 ${attempt + 1} 次点击后菜单仍在，重试`);
+    await writeLog("已点击录音，进入静默，不再回读通话界面");
+    return true;
   }
 
   await dumpScreenToLog("点击通话录音未生效时的界面");
@@ -682,7 +673,7 @@ async function handleCall(signal: AbortSignal, recording: boolean) {
 
 // ===== 唯一的执行循环：没有定时读屏，只有事件和超长兜底 =====
 async function watchCalls(signal: AbortSignal) {
-  await writeLog("通话监听已启动（1.0.11：事件唤醒，录音中降频 + 双窗口 CPU 采样）");
+  await writeLog("通话监听已启动（1.0.12：录音中零读屏 + 双窗口 CPU 采样）");
   while (!signal.aborted) {
     try {
       const timeout = session.quiet !== null ? L1_QUIET_MS : IDLE_WAIT_MS;
@@ -694,6 +685,24 @@ async function watchCalls(signal: AbortSignal) {
         stats.skipped++;
         continue;
       }
+
+      // 已点过录音（静默期）：一次无障碍操作都不做。
+      // 录音期间的通话界面每秒都在变，这时候去读最容易把 axauditd 推进
+      // 重启循环；而复位根本不需要读屏——前台离开电话类 App 就说明通话结束了。
+      if (session.quiet !== null) {
+        if (foreground !== null && !callFrontApps.has(foreground)) {
+          await writeLog("前台已离开通话界面，复位等待下一通");
+          session.quiet = null;
+          session.attempts = 0;
+          continue;
+        }
+        if (reason !== "timer") {
+          stats.skipped++;
+          continue;
+        }
+        // 定时器到点（3 分钟）才探一次，兜住「通话结束但前台仍是 SpringBoard」
+      }
+
       // 前台不是电话类 App：不可能显示通话界面，跳过这一次读屏
       if (!shouldProbe()) {
         stats.skipped++;
@@ -800,7 +809,7 @@ function simplifyTree(
 
 export default defineExtension({
   async run({ signal }) {
-    await writeLog("========== 服务已启动 (1.0.11) ==========");
+    await writeLog("========== 服务已启动 (1.0.12) ==========");
 
     await probeCapabilities();
 
